@@ -58,6 +58,44 @@ pub struct Theme {
     /// Terminal caret RGB (the `accent.cursor_color` knob; defaults to match
     /// `author_ink`).  The blink overlay/fallback paints the caret in this.
     pub cursor_ink: (f64, f64, f64),
+    /// Text glow: soft luminous halo color RGB (the `glow.color` knob).
+    pub glow_color: (f64, f64, f64),
+    /// Glow opacity 0..1 (0 disables the halo entirely).
+    pub glow_intensity: f64,
+    /// Glow blur radius in px: how far the halo spreads past the glyph edges.
+    pub glow_radius: f64,
+    /// Stroke/outline thickness in px added to the underlay text before blur.
+    pub glow_thickness: f64,
+}
+
+/// Cache for the pre-rendered static glow halo of the quote body.
+///
+/// Building the halo (a stroke-thickened underlay blurred into an A8 mask, then
+/// recolored into an ARGB32 surface) is the expensive part of the glow; it
+/// depends only on the phrase, window size and the theme's glow settings. The
+/// cache is rebuilt once per phrase and every other frame just blits the stored
+/// halo with a single fast `set_source_surface` + `paint()` — no per-frame
+/// `mask()` rasterization (the CPU hog). A glitch burst intentionally skips the
+/// blit for the burst duration, so glitch frames never pay the glow cost.
+pub struct GlowCache {
+    key: (u32, u32, String, u32),
+    mask: Option<cairo::ImageSurface>,
+    /// The halo recolored into an ARGB32 surface with the glow color/opacity
+    /// baked in, ready to be blitted directly to the frame.
+    halo: Option<cairo::ImageSurface>,
+    /// Absolute device top-left of `halo` for this window/phrase.
+    halo_pos: (f64, f64),
+}
+
+impl GlowCache {
+    pub fn new() -> Self {
+        Self {
+            key: (0, 0, String::new(), 0),
+            mask: None,
+            halo: None,
+            halo_pos: (0.0, 0.0),
+        }
+    }
 }
 
 /// Per-draw dynamic state.
@@ -88,6 +126,9 @@ pub struct DrawState<'a> {
     /// cursor (`theme.animated_scanlines`, i.e. no RGBA overlay); with a
     /// compositor the caret is painted on the scanline overlay instead.
     pub cursor_on: bool,
+    /// Mutable cache for the static glow halo (see [`GlowCache`]). `None`
+    /// disables the cached glow pipeline entirely (no halo is drawn).
+    pub glow: Option<&'a mut GlowCache>,
 }
 
 /// Parse a `"#rrggbb"` hex string into an RGB tuple.
@@ -109,7 +150,7 @@ pub fn draw(
     cr: &cairo::Context,
     w: i32,
     h: i32,
-    state: &DrawState,
+    state: &mut DrawState,
     theme: &Theme,
 ) {
     let (fw, fh) = (w as f64, h as f64);
@@ -144,7 +185,7 @@ fn draw_text_block(
     cr: &cairo::Context,
     w: f64,
     h: f64,
-    state: &DrawState,
+    state: &mut DrawState,
     theme: &Theme,
 ) -> (f64, f64) {
     let wrap = (w * WRAP_FRACTION).max(120.0);
@@ -172,10 +213,42 @@ fn draw_text_block(
     let total_chars = state.quote.text.chars().count();
     let typed = state.typewriter.min(total_chars);
     let typing = typed < total_chars;
+
+    // Glow is a *static* layer: the halo is pre-baked once per phrase into an
+    // ARGB surface (color/opacity baked in) and each frame is a single fast
+    // `paint()` blit — the budget hit happens once per phrase, never per frame.
+    // A glitch burst skips the blit for its whole duration.
+    let glow_halo = if theme.glow_intensity > 0.01 {
+        if let Some(gc) = state.glow.as_deref_mut() {
+            let intensity_bits = (theme.glow_intensity * 1000.0).round() as u32;
+            let key = (w as u32, h as u32, state.quote.text.clone(), intensity_bits);
+            if gc.key != key {
+                gc.key = key;
+                gc.mask = build_glow_mask(&quote_layout, theme);
+                gc.halo = gc.mask.as_ref().and_then(|m| build_halo_surface(m, theme));
+                gc.halo_pos = {
+                    let pad_sc = glow_pad_scaled(theme) / GLOW_SCALE;
+                    (
+                        qx + qink.x() as f64 - pad_sc,
+                        qy + qink.y() as f64 - pad_sc,
+                    )
+                };
+            }
+        }
+        state
+            .glow
+            .as_ref()
+            .and_then(|gc| gc.halo.as_ref().map(|h| (h, gc.halo_pos)))
+    } else {
+        None
+    };
+
     if state.glitch {
         // Full-text glitch burst (mirrors the HTML `glitch-full` keyframes):
         // the whole block swings left/right with cyan/magenta echo copies,
-        // occasional white invert flashes and strobe blank frames.
+        // occasional white invert flashes and strobe blank frames. The static
+        // glow layer is deliberately *not* composited for the whole burst, so
+        // glitch frames never pay the glow cost; it reappears when it ends.
         let ox = qx + state.glitch_dx;
         let oy = qy + state.glitch_dy;
         if !state.glitch_ghost {
@@ -205,10 +278,14 @@ fn draw_text_block(
     } else if typing {
         // One-shot typewriter reveal: clip the layout line-by-line to the
         // caret of the next character so lines stay centered and stable
-        // while they appear left→right.
+        // while they appear left→right. The cached halo is composited inside
+        // the same clip, so it reveals in lockstep with the crisp text.
         let byte = char_byte_index(&state.quote.text, typed);
         cr.save();
         push_typewriter_clip(cr, &quote_layout, byte, qx, qy);
+        if let Some((halo, (lx, ly))) = glow_halo {
+            blit_glow_halo(cr, halo, lx, ly);
+        }
         draw_text(cr, &quote_layout, qx, qy, theme.fg, 1.0);
         cr.restore();
         // The main layer owns the caret only in the no-overlay fallback
@@ -218,6 +295,10 @@ fn draw_text_block(
             draw_terminal_cursor(cr, &quote_layout, qx, qy, byte, theme);
         }
     } else {
+        // Steady state: the cached static halo under the crisp text.
+        if let Some((halo, (lx, ly))) = glow_halo {
+            blit_glow_halo(cr, halo, lx, ly);
+        }
         draw_text(cr, &quote_layout, qx, qy, theme.fg, 1.0);
         if theme.animated_scanlines && state.cursor_on {
             draw_terminal_cursor(cr, &quote_layout, qx, qy, quote_layout.text().len(), theme);
@@ -226,6 +307,7 @@ fn draw_text_block(
 
     // The author line joins the animation only once the quote body is fully
     // revealed. A glitch ghost strobe blanks the whole block, author included.
+    // The author renders as a single crisp pass — no halo.
     if !typing && !(state.glitch && state.glitch_ghost) {
         let (ar, ag, ab) = theme.author_ink;
         draw_text_fade_author(cr, &author_layout, ax, ay, (ar, ag, ab));
@@ -266,6 +348,243 @@ fn draw_text_fade_author(
     color: (f64, f64, f64),
 ) {
     draw_text(cr, layout, x, y, color, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Text glow
+// ---------------------------------------------------------------------------
+
+/// Approximate Gaussian blur on an A8 buffer: 2 passes (horizontal + vertical)
+/// of a clamped box filter with a sliding window. `kernel` is the box
+/// half-width in pixels; clamped edges avoid dark halos at the boundary.
+///
+/// Operates purely on safe Rust slices — no aliasing through cairo's shared
+/// `with_data` borrows, which the release optimizer used to exploit (mutation
+/// through a `&[u8]` is UB and silently dropped the pixels).
+fn box_blur(data: &mut [u8], w: usize, h: usize, stride: usize, kernel: f64) {
+    let k = kernel.max(1.0).floor() as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut tmp = vec![0u8; h * stride];
+
+    // Vertical pass: read `data`, write `tmp`.
+    for x in 0..w {
+        let mut sum: u64 = 0;
+        let mut cnt: u64 = 0;
+        let first = k.min(h - 1);
+        for y in 0..=first {
+            sum += data[y * stride + x] as u64;
+            cnt += 1;
+        }
+        tmp[x] = (sum / cnt) as u8;
+        for i in 1..h {
+            if i + k < h {
+                sum += data[(i + k) * stride + x] as u64;
+                cnt += 1;
+            }
+            if i > k {
+                sum -= data[(i - k - 1) * stride + x] as u64;
+                cnt -= 1;
+            }
+            tmp[i * stride + x] = (sum / cnt.max(1)) as u8;
+        }
+    }
+
+    // Horizontal pass: read `tmp`, write `data`.
+    for y in 0..h {
+        let row = y * stride;
+        let mut sum: u64 = 0;
+        let mut cnt: u64 = 0;
+        let first = k.min(w - 1);
+        for x in 0..=first {
+            sum += tmp[row + x] as u64;
+            cnt += 1;
+        }
+        data[row] = (sum / cnt) as u8;
+        for x in 1..w {
+            if x + k < w {
+                sum += tmp[row + x + k] as u64;
+                cnt += 1;
+            }
+            if x > k {
+                sum -= tmp[row + x - k - 1] as u64;
+                cnt -= 1;
+            }
+            data[row + x] = (sum / cnt.max(1)) as u8;
+        }
+    }
+}
+
+const GLOW_SCALE: f64 = 1.5;
+
+/// Mask-space padding for the glow geometry: the underlay stroke growth plus
+/// the blur reach, both in the scaled mask space, so neither clamps against
+/// the mask boundary. `pad / GLOW_SCALE` is that padding in device px.
+fn glow_pad_scaled(theme: &Theme) -> f64 {
+    let sc = GLOW_SCALE;
+    (theme.glow_thickness.max(0.0) * sc + theme.glow_radius.max(0.5) * sc * 0.9 + 3.0)
+        .ceil()
+        .max(8.0)
+}
+
+/// Build the reusable glow halo for *any* text layout. Per the recipe the
+/// underlay is layered: (1) the same text rendered with a thicker outline —
+/// the path stroked with round joins/caps (`glow_thickness`), (2) blurred into
+/// a soft halo (`glow_radius` spread, 4 box passes ≈ a Gaussian), into an A8
+/// mask at 1.5× scale; the crisp text is then drawn by the caller on top. The
+/// halo's color/opacity are applied at composite time.
+///
+/// The returned mask is text-tight (padded only for the stroke + blur reach)
+/// and entirely static for a given phrase/layout/geometry — callers cache it
+/// so the expensive blur is paid once per phrase, not once per frame.
+pub fn build_glow_mask(layout: &pango::Layout, theme: &Theme) -> Option<cairo::ImageSurface> {
+    let (ink, _) = layout.pixel_extents();
+    let (cw, ch) = (ink.width() as f64, ink.height() as f64);
+    if cw < 1.0 || ch < 1.0 {
+        return None;
+    }
+    let sc = GLOW_SCALE;
+    let pad = glow_pad_scaled(theme);
+    let bw = (cw * sc + 2.0 * pad).ceil() as i32;
+    let bh = (ch * sc + 2.0 * pad).ceil() as i32;
+    if bw <= 0 || bh <= 0 {
+        return None;
+    }
+
+    // 1. Thicker underlay: the text path stroked (round joins/caps) then
+    //    filled, so the silhouette extends `thickness` px on every side.
+    let mask = cairo::ImageSurface::create(cairo::Format::A8, bw, bh).expect("glow mask surface");
+    {
+        let tc = cairo::Context::new(&mask).expect("glow mask context");
+        tc.scale(sc, sc);
+        tc.translate(-ink.x() as f64 + pad / sc, -ink.y() as f64 + pad / sc);
+        pangocairo::layout_path(&tc, layout);
+        tc.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+        tc.set_line_width(2.0 * theme.glow_thickness.max(0.0));
+        tc.set_line_join(cairo::LineJoin::Round);
+        tc.set_line_cap(cairo::LineCap::Round);
+        tc.stroke_preserve();
+        tc.fill();
+    }
+
+    // 2. Blur the underlay (4 cumulative box passes ≈ a Gaussian). All byte
+    //    work happens in a plain `Vec` so the release build can't optimize
+    //    away aliased writes; the blurred A8 surface is assembled from the
+    //    finished buffer.
+    let stride = mask.stride() as usize;
+    let mut data = vec![0u8; stride * bh as usize];
+    mask.flush();
+    mask.with_data(|src| {
+        data.copy_from_slice(src);
+    })
+    .expect("read glow mask for blur");
+    let kernel = theme.glow_radius.max(0.5) * sc / 4.0;
+    for _ in 0..4 {
+        box_blur(&mut data, bw as usize, bh as usize, stride, kernel);
+    }
+    Some(
+        cairo::ImageSurface::create_for_data(data, cairo::Format::A8, bw, bh, mask.stride())
+            .expect("glow blurred mask surface"),
+    )
+}
+
+/// Composite a cached glow mask under sharp text. The pattern maps device px →
+/// pattern space with a 1/`GLOW_SCALE` scale, so the 1.5× mask lands exactly
+/// text-sized at (`x`, `y`); `ink` is the layout's ink extents, which pin the
+/// halo to the same anchor the sharp pass uses. Halo color/opacity come from
+/// the theme, so one cached mask serves any applied intensity.
+///
+/// Together with [`build_glow_mask`] this lets any text layout get the glow:
+/// build the mask once for the layout, then composite it (optionally inside a
+/// clipping region) right before drawing the crisp text at the same `x,y`.
+pub fn composite_glow_mask(
+    cr: &cairo::Context,
+    mask: &cairo::ImageSurface,
+    x: f64,
+    y: f64,
+    ink: &pango::Rectangle,
+    theme: &Theme,
+) {
+    let sc = GLOW_SCALE;
+    let pad_sc = glow_pad_scaled(theme) / sc;
+    let pat = cairo::SurfacePattern::create(mask);
+    pat.set_extend(cairo::Extend::None);
+    let px = x + ink.x() as f64 - pad_sc;
+    let py = y + ink.y() as f64 - pad_sc;
+    pat.set_matrix(cairo::Matrix::new(sc, 0.0, 0.0, sc, -px * sc, -py * sc));
+    let (gr, gg, gb) = theme.glow_color;
+    cr.set_source_rgba(gr, gg, gb, theme.glow_intensity.clamp(0.0, 1.0));
+    cr.mask(&pat);
+}
+
+/// Blit a pre-baked halo surface onto the frame at its absolute device
+/// (`lx`, `ly`). The halo is rasterized at device resolution during the build,
+/// so this stays an identity-transform `paint()` restricted to an explicit
+/// clip rect — cairo only composites the small halo region, never the whole
+/// screen (the scale+transform variant forced a full-frame re-raster and
+/// cost ~6× more CPU).
+fn blit_glow_halo(cr: &cairo::Context, halo: &cairo::ImageSurface, lx: f64, ly: f64) {
+    cr.save();
+    cr.rectangle(lx, ly, halo.width() as f64, halo.height() as f64);
+    cr.clip();
+    cr.set_source_surface(halo, lx, ly);
+    cr.paint();
+    cr.restore();
+}
+
+/// Recolor an A8 glow mask into an ARGB32 surface with the glow color/opacity
+/// baked into the alpha channel (premultiplied) and downscaled to device
+/// resolution, so compositing it each frame is a tiny identity `paint()` — no
+/// per-frame scaling or mask rasterization. Returns `None` only for an empty
+/// surface.
+fn build_halo_surface(mask: &cairo::ImageSurface, theme: &Theme) -> Option<cairo::ImageSurface> {
+    let (bw, bh) = (mask.width(), mask.height());
+    if bw <= 0 || bh <= 0 {
+        return None;
+    }
+    let sc = GLOW_SCALE;
+    // Colored halo at the 1.5× mask resolution (premultiplied ARGB). Built in a
+    // plain `Vec` (BGRA order, no aliased `with_data` writes) so release builds
+    // keep the pixels, then handed to cairo by ownership.
+    let (gr, gg, gb) = theme.glow_color;
+    let a = theme.glow_intensity.clamp(0.0, 1.0);
+    let src_stride = mask.stride() as usize;
+    let big_stride = cairo::Format::ARgb32.stride_for_width(bw as u32).expect("stride");
+    mask.flush();
+    let mut big_data = vec![0u8; big_stride as usize * bh as usize];
+    mask.with_data(|src| {
+        let (w, h) = (bw as usize, bh as usize);
+        for y in 0..h {
+            let srow = y * src_stride;
+            let drow = y * big_stride as usize;
+            for x in 0..w {
+                let m = src[srow + x] as f64 / 255.0 * a;
+                let o = drow + x * 4;
+                big_data[o] = (gb * m * 255.0) as u8;
+                big_data[o + 1] = (gg * m * 255.0) as u8;
+                big_data[o + 2] = (gr * m * 255.0) as u8;
+                big_data[o + 3] = (m * 255.0) as u8;
+            }
+        }
+    })
+    .expect("read glow mask for halo");
+    let big = cairo::ImageSurface::create_for_data(big_data, cairo::Format::ARgb32, bw, bh, big_stride)
+        .expect("glow halo surface");
+
+    // Downscale to device resolution once (bilinear) so per-frame blits cost
+    // the same as a small region paint with an identity transform.
+    let dw = ((bw as f64) / sc).ceil() as i32;
+    let dh = ((bh as f64) / sc).ceil() as i32;
+    let halo = cairo::ImageSurface::create(cairo::Format::ARgb32, dw, dh)
+        .expect("glow halo device surface");
+    {
+        let hc = cairo::Context::new(&halo).expect("glow halo device context");
+        hc.scale(1.0 / sc, 1.0 / sc);
+        hc.set_source_surface(&big, 0.0, 0.0);
+        hc.paint();
+    }
+    Some(halo)
 }
 
 /// Terminal-style block cursor at byte offset `at` of the quote (the insert
@@ -499,6 +818,10 @@ mod tests {
             glitch_intensity: 0.35,
             author_ink: (0.63, 0.16, 0.90),
             cursor_ink: (0.63, 0.16, 0.90),
+            glow_color: (0.22, 0.90, 1.0),
+            glow_intensity: 0.45,
+            glow_radius: 4.0,
+            glow_thickness: 2.0,
         }
     }
 
@@ -517,7 +840,7 @@ mod tests {
         let cr = cairo::Context::new(&surf).expect("context");
 
         let theme = test_theme();
-        let state = DrawState {
+        let mut state = DrawState {
             quote: &test_quote(),
             glitch: true,
             glitch_dx: 42.0,
@@ -527,8 +850,9 @@ mod tests {
             glitch_ghost: false,
             typewriter: test_quote().text.chars().count(),
             cursor_on: true,
+            glow: None,
         };
-        draw(&cr, w, h, &state, &theme);
+        draw(&cr, w, h, &mut state, &theme);
 
         let mut file = std::fs::File::create("/tmp/render_test.png").expect("create png");
         surf.as_ref().write_to_png(&mut file).expect("png");
@@ -541,7 +865,7 @@ mod tests {
         let mut surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
 
         let theme = test_theme();
-        let state = DrawState {
+        let mut state = DrawState {
             quote: &test_quote(),
             glitch: false,
             glitch_dx: 0.0,
@@ -551,10 +875,11 @@ mod tests {
             glitch_ghost: false,
             typewriter: test_quote().text.chars().count(),
             cursor_on: true,
+            glow: None,
         };
         {
             let cr = cairo::Context::new(&surf).expect("context");
-            draw(&cr, w, h, &state, &theme);
+            draw(&cr, w, h, &mut state, &theme);
         } // drop the context so surf.data() can get exclusive access
 
         // Sample the center band (text area, before vignette darkens the edges).
@@ -584,7 +909,7 @@ mod tests {
         let mut surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
 
         let theme = test_theme();
-        let state = DrawState {
+        let mut state = DrawState {
             quote: &test_quote(),
             glitch: true,
             glitch_dx: 30.0,
@@ -594,10 +919,11 @@ mod tests {
             glitch_ghost: true,
             typewriter: test_quote().text.chars().count(),
             cursor_on: true,
+            glow: None,
         };
         {
             let cr = cairo::Context::new(&surf).expect("context");
-            draw(&cr, w, h, &state, &theme);
+            draw(&cr, w, h, &mut state, &theme);
         }
 
         let data = surf.data().expect("surface data");
@@ -627,7 +953,7 @@ mod tests {
         let mut surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
 
         let theme = test_theme();
-        let state = DrawState {
+        let mut state = DrawState {
             quote: &test_quote(),
             glitch: true,
             glitch_dx: 10.0,
@@ -637,10 +963,11 @@ mod tests {
             glitch_ghost: false,
             typewriter: test_quote().text.chars().count(),
             cursor_on: true,
+            glow: None,
         };
         {
             let cr = cairo::Context::new(&surf).expect("context");
-            draw(&cr, w, h, &state, &theme);
+            draw(&cr, w, h, &mut state, &theme);
         }
 
         let data = surf.data().expect("surface data");
@@ -688,7 +1015,7 @@ mod tests {
             let mut s = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
             {
                 let cr = cairo::Context::new(&s).expect("context");
-                let state = DrawState {
+                let mut state = DrawState {
                     quote: &test_quote(),
                     glitch: false,
                     glitch_dx: 0.0,
@@ -698,8 +1025,9 @@ mod tests {
                     glitch_ghost: false,
                     typewriter: typed,
                     cursor_on: true,
+                    glow: None,
                 };
-                draw(&cr, w, h, &state, &theme);
+                draw(&cr, w, h, &mut state, &theme);
             }
             s
         };
@@ -737,7 +1065,7 @@ mod tests {
             let mut s = cairo::ImageSurface::create(cairo::Format::ARgb32, nw, nh).expect("surface");
             {
                 let cr = cairo::Context::new(&s).expect("context");
-                let state = DrawState {
+                let mut state = DrawState {
                     quote: &test_quote(),
                     glitch: false,
                     glitch_dx: 0.0,
@@ -747,8 +1075,9 @@ mod tests {
                     glitch_ghost: false,
                     typewriter: typed,
                     cursor_on: true,
+                    glow: None,
                 };
-                draw(&cr, nw, nh, &state, &theme);
+                draw(&cr, nw, nh, &mut state, &theme);
             }
             s
         };
@@ -777,7 +1106,7 @@ mod tests {
             let mut s = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
             {
                 let cr = cairo::Context::new(&s).expect("context");
-                let state = DrawState {
+                let mut state = DrawState {
                     quote: &test_quote(),
                     glitch: false,
                     glitch_dx: 0.0,
@@ -789,8 +1118,9 @@ mod tests {
                     // blinking terminal shows at the typing position.
                     typewriter: total.saturating_sub(1),
                     cursor_on,
+                    glow: None,
                 };
-                draw(&cr, w, h, &state, &theme);
+                draw(&cr, w, h, &mut state, &theme);
             }
             s
         };
@@ -818,6 +1148,79 @@ mod tests {
         assert!(
             diff > 400,
             "cursor_on must add a substantial caret block (diff={diff})"
+        );
+    }
+
+    /// The glow halo: rendering the same (steady, no-glitch) frame with the
+    /// glow enabled must add a substantial band of cyan-tinted halo pixels
+    /// around the crisp text that is absent when the glow is off.  The halo is
+    /// semi-transparent, so overlapping crisp white glyph cores stay white.
+    /// A glitch frame must NOT composite the static glow layer (the lag-fix
+    /// strategy), so it carries no more halo than the glow-off frame.
+    #[test]
+    fn glow_adds_halo_pixels() {
+        let (w, h) = (900, 400);
+        let base_theme = test_theme();
+
+        // base_theme.glow_color == (0.22, 0.90, 1.0) cyan.
+        let mut cache = GlowCache::new();
+        let render = |glow_intensity: f64, glitch: bool, cache: &mut GlowCache| -> cairo::ImageSurface {
+            let mut theme = base_theme.clone();
+            theme.glow_intensity = glow_intensity;
+            let mut s = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
+            {
+                let cr = cairo::Context::new(&s).expect("context");
+                let mut state = DrawState {
+                    quote: &test_quote(),
+                    glitch,
+                    glitch_dx: 0.0,
+                    glitch_dy: 0.0,
+                    glitch_echo_px: 0.0,
+                    glitch_invert: false,
+                    glitch_ghost: false,
+                    typewriter: test_quote().text.chars().count(),
+                    cursor_on: false,
+                    glow: Some(cache),
+                };
+                draw(&cr, w, h, &mut state, &theme);
+            }
+            s
+        };
+
+        fn cyan_halo(surf: &mut cairo::ImageSurface, w: i32, h: i32) -> i64 {
+            // Premultiplied BGRA: bytes [B,G,R,A].  Count pixels that are
+            // clearly cyan-tinted (halo color at the test intensity over the
+            // dark background); crisp white text and background never match.
+            let data = surf.data().expect("surface data");
+            let mut n = 0i64;
+            for y in 0..h {
+                for x in 0..w {
+                    let pl = (y * w as i32 + x) as usize * 4;
+                    let b = data[pl] as i32;
+                    let g = data[pl + 1] as i32;
+                    let r = data[pl + 2] as i32;
+                    if b > 40 && g > 30 && r < 90 && (b - r) > 30 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        }
+
+        // Reuse one cache across renders: the halo mask is built once (first
+        // call) and only composited with the requested intensity afterwards.
+        let steady = cyan_halo(&mut render(0.45, false, &mut cache), w, h);
+        let no_glow = cyan_halo(&mut render(0.0, false, &mut cache), w, h);
+        assert!(
+            steady > no_glow + 200,
+            "glow must add a cyan halo ({steady} px) well beyond the no-glow frame ({no_glow} px)"
+        );
+        // Lag fix: while a glitch burst is active the static glow layer is
+        // hidden, so the frame has essentially no halo despite glow being on.
+        let glitching = cyan_halo(&mut render(0.45, true, &mut cache), w, h);
+        assert!(
+            glitching <= no_glow + 20,
+            "glitch frames must hide the glow layer ({glitching} halo px vs no-glow {no_glow} px)"
         );
     }
 }

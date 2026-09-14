@@ -38,6 +38,13 @@
 //!   │   scanline_size_rem: 0.1                     # line thickness in rem │
 //!   │   crt_curvature: 0.12                       # screen bend factor    │
 //!   │                                                                 │
+//!   │ glow:                                                           │
+//!   │   enabled: true                            # master switch         │
+//!   │   color: "#39e6ff"                         # halo CSS hex color     │
+//!   │   radius: 4.0                              # blur spread in px       │
+//!   │   intensity: 0.45                          # halo opacity 0-1        │
+//!   │   thickness: 2.0                           # underlay stroke in px   │
+//!   │                                                                 │
 //!   │ quotes:                                                        │
 //!   │   source: "quotes.txt"                       # path or url          │
 //!   │   cycle_interval_minutes: 15                # rotation period       │
@@ -74,6 +81,9 @@ pub struct Config {
     /// Accent / effect settings: cyan, magenta, glitch, scanlines, CRT.
     #[serde(default)]
     pub accent: AccentConfig,
+    /// Glow effect settings for the quote text.
+    #[serde(default)]
+    pub glow: GlowConfig,
     /// Quote-pipeline settings (also read by Agent 3 directly from the file).
     #[serde(default)]
     pub quotes: QuotesConfig,
@@ -88,6 +98,7 @@ impl Config {
         Self {
             display: DisplayConfig::defaults(),
             accent: AccentConfig::defaults(),
+            glow: GlowConfig::defaults(),
             quotes: QuotesConfig::defaults(),
             monitors: MonitorsConfig::defaults(),
         }
@@ -239,6 +250,61 @@ impl AccentConfig {
 }
 
 impl Default for AccentConfig {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+/// Text-glow config: a soft luminous halo around the quote text (the HTML
+/// fork's `text-shadow` equivalent).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GlowConfig {
+    /// Master switch: `false` draws plain text with no halo.
+    #[serde(default = "GlowConfig::default_enabled")]
+    pub enabled: bool,
+    /// Halo color, CSS hex (`"#rrggbb"`).
+    #[serde(default = "GlowConfig::default_color")]
+    pub color: String,
+    /// Blur radius in px: how far the halo spreads past the glyph edges.
+    #[serde(default = "GlowConfig::default_radius")]
+    pub radius: f64,
+    /// Halo opacity 0..1 (0 turns the glow off).
+    #[serde(default = "GlowConfig::default_intensity")]
+    pub intensity: f64,
+    /// Stroke/outline thickness in px added to the underlay text before it is
+    /// blurred (a thicker silhouette → a fuller, more even halo).
+    #[serde(default = "GlowConfig::default_thickness")]
+    pub thickness: f64,
+}
+
+impl GlowConfig {
+    fn defaults() -> Self {
+        Self {
+            enabled: Self::default_enabled(),
+            color: Self::default_color(),
+            radius: Self::default_radius(),
+            intensity: Self::default_intensity(),
+            thickness: Self::default_thickness(),
+        }
+    }
+    fn default_enabled() -> bool {
+        true
+    }
+    fn default_color() -> String {
+        "#F4E394".into()
+    }
+    fn default_radius() -> f64 {
+        15.0
+    }
+    fn default_intensity() -> f64 {
+        0.45
+    }
+    fn default_thickness() -> f64 {
+        1.0
+    }
+}
+
+impl Default for GlowConfig {
     fn default() -> Self {
         Self::defaults()
     }
@@ -661,6 +727,13 @@ scanline_lines = 360
 scanline_size_rem = 0.07
 crt_curvature = 0.18
 
+[glow]
+enabled = true
+color = "#00ffcc"
+radius = 6.0
+intensity = 0.7
+thickness = 1.5
+
 [quotes]
 source = "~/quotes.txt"
 cycle_interval_minutes = 8
@@ -698,6 +771,12 @@ primary_only = true
         assert!((c.accent.scanline_size_rem - 0.07).abs() < 0.01);
         assert!((c.accent.crt_curvature - 0.18).abs() < 0.01);
 
+        assert!(c.glow.enabled);
+        assert_eq!(c.glow.color, "#00ffcc");
+        assert!((c.glow.radius - 6.0).abs() < 0.01);
+        assert!((c.glow.intensity - 0.7).abs() < 0.01);
+        assert!((c.glow.thickness - 1.5).abs() < 0.01);
+
         assert_eq!(c.quotes.source, "~/quotes.txt");
         assert_eq!(c.quotes.cycle_interval_minutes, 8);
         assert_eq!(c.quotes.picker, "sequential");
@@ -727,6 +806,11 @@ primary_only = true
         assert_eq!(c.accent.scanline_lines, AccentConfig::default_scanline_lines());
         assert!((c.accent.scanline_size_rem - AccentConfig::default_scanline_size_rem()).abs() < 0.01);
         assert!((c.accent.crt_curvature - AccentConfig::default_crt_curvature()).abs() < 0.01);
+        assert_eq!(c.glow.enabled, GlowConfig::default_enabled());
+        assert_eq!(c.glow.color, GlowConfig::default_color());
+        assert!((c.glow.radius - GlowConfig::default_radius()).abs() < 0.01);
+        assert!((c.glow.intensity - GlowConfig::default_intensity()).abs() < 0.01);
+        assert!((c.glow.thickness - GlowConfig::default_thickness()).abs() < 0.01);
         assert_eq!(c.quotes.source, QuotesConfig::default_source());
         assert_eq!(c.quotes.cycle_interval_minutes, QuotesConfig::default_cycle_interval_minutes());
         assert_eq!(c.quotes.picker, QuotesConfig::default_picker());

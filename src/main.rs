@@ -115,6 +115,14 @@ fn build_windows(app: &Application) {
         glitch_intensity: cfg.accent.glitch_intensity.clamp(0.0, 1.0) as f64,
         author_ink: render::hex_color(&cfg.accent.author_color),
         cursor_ink: render::hex_color(&cfg.accent.cursor_color),
+        glow_color: render::hex_color(&cfg.glow.color),
+        glow_intensity: if cfg.glow.enabled {
+            cfg.glow.intensity.clamp(0.0, 1.0) as f64
+        } else {
+            0.0
+        },
+        glow_radius: cfg.glow.radius.max(0.0) as f64,
+        glow_thickness: cfg.glow.thickness.max(0.0) as f64,
     };
 
     // ---- monitor policy ----
@@ -281,6 +289,7 @@ fn build_monitor_window(
     let glitch_invert = Rc::new(Cell::new(false));
     let glitch_ghost = Rc::new(Cell::new(false));
     let glitch_echo_px = Rc::new(Cell::new(0.0f64));
+    let glow_cache = Rc::new(RefCell::new(render::GlowCache::new()));
 
     // Main layer draws its own static scanlines only when there is no RGBA
     // compositor to host the animated overlay (avoids double-darkening).
@@ -299,9 +308,11 @@ fn build_monitor_window(
     let typer = typewriter_chars.clone();
     let cursor_on_draw = cursor_on.clone();
     let area_all = area.clone();
+    let glow_draw = glow_cache.clone();
     area.connect_draw(move |_, cr| {
         let q = q.borrow();
-        let state = render::DrawState {
+        let mut glow = glow_draw.borrow_mut();
+        let mut state = render::DrawState {
             quote: &q,
             glitch: g_on.get(),
             glitch_dx: g_dx.get(),
@@ -311,8 +322,9 @@ fn build_monitor_window(
             glitch_ghost: g_gh.get(),
             typewriter: typer.get(),
             cursor_on: cursor_on_draw.get(),
+            glow: Some(&mut glow),
         };
-        render::draw(cr, area_all.allocated_width(), area_all.allocated_height(), &state, &main_theme);
+        render::draw(cr, area_all.allocated_width(), area_all.allocated_height(), &mut state, &main_theme);
         glib::Propagation::Proceed
     });
 

@@ -14,8 +14,8 @@ foreground_color = "#ffffff"
 cyan = "#39e6ff"
 magenta = "#ff3de6"
 orange = "#ffe3b3"
-author_color = "#ffa028"
-cursor_color = "#ffa028"
+author_color = "#F4E394"
+cursor_color = "#F4E394"
 glitch_intensity = 0.35
 glitch_duration = 0.5
 glitch_interval = 6.5
@@ -24,6 +24,13 @@ scanline_steps = 2160
 scanline_lines = 216
 scanline_size_rem = 0.1
 crt_curvature = 0.15
+
+[glow]
+enabled = true
+color = "#F4E394"
+radius = 15.0
+intensity = 0.45
+thickness = 1.0
 
 [quotes]
 # Relative to the working directory, or an absolute path.
