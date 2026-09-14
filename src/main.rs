@@ -7,7 +7,7 @@
 //! order == a wallpaper.  A `DrawingArea` paints the quote ticker via the
 //! `render` module (Cairo/Pango): no WebView, no JS.  Each phrase opens with a
 //! one-shot typewriter reveal (~30 ms/char, see `start_typewriter`); when it is
-//! done the text/glow layer redraws only on quote changes, glitch bursts, or
+//! done the text layer redraws only on quote changes, glitch bursts, or
 //! resize.  The only things that change continuously are a transparent RGBA
 //! overlay rolling the scanlines top→bottom at ~20 fps (cheap: just the
 //! scanline bands) and the blinking terminal caret riding that same overlay
@@ -113,12 +113,8 @@ fn build_windows(app: &Application) {
         scanline_lines: cfg.accent.scanline_lines,
         animated_scanlines: false, // flipped per-window once RGBA is probed
         glitch_intensity: cfg.accent.glitch_intensity.clamp(0.0, 1.0) as f64,
-        glow_radius: cfg.accent.glow_radius.max(0.0) as f64,
-        glow_alpha: cfg.accent.glow_alpha.clamp(0.0, 1.0) as f64,
-        glow_offset_x: cfg.accent.glow_offset_x as f64,
-        glow_offset_y: cfg.accent.glow_offset_y as f64,
-        glow_color: render::hex_color(&cfg.accent.glow_color),
         author_ink: render::hex_color(&cfg.accent.author_color),
+        cursor_ink: render::hex_color(&cfg.accent.cursor_color),
     };
 
     // ---- monitor policy ----
@@ -348,13 +344,13 @@ fn build_monitor_window(
             }
             // The blinking terminal caret rides this overlay: it is a single
             // small rect fill per frame, so its ~2 Hz blink costs nothing on
-            // the heavy text/glow layer.  Hidden during a glitch burst.
+            // the heavy text layer.  Hidden during a glitch burst.
             if s_cursor.get() && !s_glitch.get() {
                 let qb = s_quote.borrow();
                 if let Some((cx, cy, cw, ch)) = render::cursor_rect(
                     cr, &s_theme, &qb.text, &qb.author, s_typer.get(), tw as f64, th as f64,
                 ) {
-                    let (r, g, b) = s_theme.author_ink;
+                    let (r, g, b) = s_theme.cursor_ink;
                     cr.set_source_rgba(r, g, b, 0.9);
                     cr.rectangle(cx, cy, cw, ch);
                     let _ = cr.fill();
@@ -620,7 +616,7 @@ fn start_typewriter(
 /// Toggle the terminal caret blink phase every `CURSOR_BLINK_MS` (a classic
 /// ~1.9 Hz terminal timing).  With an RGBA compositor the caret lives on the
 /// scanline overlay, whose repaint this ticker also triggers — the heavy
-/// text/glow layer is never redrawn by the blink.  Without a compositor the
+/// text layer is never redrawn by the blink.  Without a compositor the
 /// main layer owns the caret and gets the redraw instead (rare fallback).
 const CURSOR_BLINK_MS: u64 = 530;
 
@@ -641,7 +637,7 @@ fn arm_cursor_blink(area: &DrawingArea, overlay: Option<&DrawingArea>, cursor_on
 /// Roll the scanline mesh continuously from the top edge toward the bottom.
 /// One full screen-height sweep takes `SCAN_SWEEP_SECS` (matches the HTML
 /// version's `--scanline-speed: 90s`), redrawn at ~20 fps.  The per-frame work
-/// is only the overlay's ~`lines` thin bands — the text/glow layer is not
+/// is only the overlay's ~`lines` thin bands — the text layer is not
 /// repainted by this timer.
 const SCAN_SWEEP_SECS: f64 = 90.0;
 const SCAN_ANIM_MS: u64 = 50;
