@@ -5,10 +5,14 @@
 //! `_NET_WM_WINDOW_TYPE_DESKTOP` at map time, exactly like the old webkit2gtk
 //! builds) so bspwm skips tiling it and keeps it at the bottom of the stacking
 //! order == a wallpaper.  A `DrawingArea` paints the quote ticker via the
-//! `render` module (Cairo/Pango): no WebView, no JS.  The text/glow layer is
-//! redrawn only on quote changes, glitch bursts, or resize; the only thing
-//! that animates continuously is a transparent RGBA overlay rolling the
-//! scanlines top→bottom at ~20 fps (cheap: just the scanline bands).
+//! `render` module (Cairo/Pango): no WebView, no JS.  Each phrase opens with a
+//! one-shot typewriter reveal (~30 ms/char, see `start_typewriter`); when it is
+//! done the text/glow layer redraws only on quote changes, glitch bursts, or
+//! resize.  The only things that change continuously are a transparent RGBA
+//! overlay rolling the scanlines top→bottom at ~20 fps (cheap: just the
+//! scanline bands) and the blinking terminal caret riding that same overlay
+//! (`arm_cursor_blink`, ~1.9 Hz) — the heavy layer is never repainted for
+//! either.
 //!
 //! `config`/`quotes` are shared verbatim with the original repo, so this binary
 //! reads the same `~/.config/bspwm-cyberquote/config.toml` and quote pool.
@@ -26,6 +30,10 @@ use rand::Rng;
 use bspwm_cyberquote::config::{Config, ConfigMonitorInfo, Orientation, WindowGeometry};
 use bspwm_cyberquote::quotes::{load_all, load_and_pick_many, Quote};
 use bspwm_cyberquote::render;
+
+/// Lazily-built scanline tile for the animated overlay: keyed by (w, h), so
+/// it's rebuilt only on resize and reused for the whole 20 fps sweep.
+type TileCache = Rc<RefCell<Option<(usize, usize, gtk::cairo::ImageSurface)>>>;
 
 // ---------------------------------------------------------------------------
 // Config path — matches the original and the fork's shared config module.
@@ -57,11 +65,21 @@ struct MonitorWindow {
     window: ApplicationWindow,
     area: DrawingArea,
     scan_area: DrawingArea,
+    scan_tile: TileCache,
     quote: Rc<RefCell<Quote>>,
     glitch_on: Rc<Cell<bool>>,
     glitch_dx: Rc<Cell<f64>>,
     glitch_dy: Rc<Cell<f64>>,
+    glitch_invert: Rc<Cell<bool>>,
+    glitch_ghost: Rc<Cell<bool>>,
+    glitch_echo_px: Rc<Cell<f64>>,
     scan_phase: Rc<Cell<f64>>,
+    /// Typewriter reveal progress (chars of the current quote shown so far).
+    typewriter_chars: Rc<Cell<usize>>,
+    /// Bumped every time a new phrase starts, so stale reveal timers die.
+    typewriter_token: Rc<Cell<u64>>,
+    /// Blink phase of the terminal caret (toggled by `arm_cursor_blink`).
+    cursor_on: Rc<Cell<bool>>,
 }
 
 fn main() {
@@ -95,6 +113,12 @@ fn build_windows(app: &Application) {
         scanline_lines: cfg.accent.scanline_lines,
         animated_scanlines: false, // flipped per-window once RGBA is probed
         glitch_intensity: cfg.accent.glitch_intensity.clamp(0.0, 1.0) as f64,
+        glow_radius: cfg.accent.glow_radius.max(0.0) as f64,
+        glow_alpha: cfg.accent.glow_alpha.clamp(0.0, 1.0) as f64,
+        glow_offset_x: cfg.accent.glow_offset_x as f64,
+        glow_offset_y: cfg.accent.glow_offset_y as f64,
+        glow_color: render::hex_color(&cfg.accent.glow_color),
+        author_ink: render::hex_color(&cfg.accent.author_color),
     };
 
     // ---- monitor policy ----
@@ -158,9 +182,28 @@ fn build_windows(app: &Application) {
         let mw = build_monitor_window(
             app, &cfg, theme.clone(), geometry, selections[idx].quote.clone(), is_wayland,
         );
-        arm_glitch_timer(&mw.area, &mw.glitch_on, &mw.glitch_dx, &mw.glitch_dy, glitch_ms);
+        arm_glitch_timer(
+            &mw.area,
+            &mw.glitch_on,
+            &mw.glitch_dx,
+            &mw.glitch_dy,
+            &mw.glitch_invert,
+            &mw.glitch_ghost,
+            &mw.glitch_echo_px,
+            glitch_ms,
+            theme.glitch_intensity,
+        );
+        // One-shot typewriter reveal for the first phrase each monitor sees.
+        start_typewriter(&mw.area, &mw.quote, &mw.typewriter_chars, &mw.typewriter_token);
         if cycle_minutes > 0 {
-            arm_cycle_timer(&mw.area, &mw.quote, &pool, cycle_minutes);
+            arm_cycle_timer(
+                &mw.area,
+                &mw.quote,
+                &pool,
+                cycle_minutes,
+                &mw.typewriter_chars,
+                &mw.typewriter_token,
+            );
         }
         arm_scan_timer(&mw.scan_area, &mw.scan_phase, geometry.height as f64, cfg.accent.scanline_lines);
         mw.window.show_all();
@@ -218,6 +261,10 @@ fn build_monitor_window(
 
     let scan_area = DrawingArea::new();
     let scan_phase = Rc::new(Cell::new(0.0f64));
+    let scan_tile = Rc::new(RefCell::new(None));
+    let typewriter_chars = Rc::new(Cell::new(0usize));
+    let typewriter_token = Rc::new(Cell::new(0u64));
+    let cursor_on = Rc::new(Cell::new(true));
     let animated = has_rgba;
     if animated {
         if let Some(v) = screen.rgba_visual() {
@@ -235,6 +282,9 @@ fn build_monitor_window(
     let glitch_on = Rc::new(Cell::new(false));
     let glitch_dx = Rc::new(Cell::new(0.0f64));
     let glitch_dy = Rc::new(Cell::new(0.0f64));
+    let glitch_invert = Rc::new(Cell::new(false));
+    let glitch_ghost = Rc::new(Cell::new(false));
+    let glitch_echo_px = Rc::new(Cell::new(0.0f64));
 
     // Main layer draws its own static scanlines only when there is no RGBA
     // compositor to host the animated overlay (avoids double-darkening).
@@ -247,6 +297,11 @@ fn build_monitor_window(
     let g_on = glitch_on.clone();
     let g_dx = glitch_dx.clone();
     let g_dy = glitch_dy.clone();
+    let g_inv = glitch_invert.clone();
+    let g_gh = glitch_ghost.clone();
+    let g_echo = glitch_echo_px.clone();
+    let typer = typewriter_chars.clone();
+    let cursor_on_draw = cursor_on.clone();
     let area_all = area.clone();
     area.connect_draw(move |_, cr| {
         let q = q.borrow();
@@ -255,6 +310,11 @@ fn build_monitor_window(
             glitch: g_on.get(),
             glitch_dx: g_dx.get(),
             glitch_dy: g_dy.get(),
+            glitch_echo_px: g_echo.get(),
+            glitch_invert: g_inv.get(),
+            glitch_ghost: g_gh.get(),
+            typewriter: typer.get(),
+            cursor_on: cursor_on_draw.get(),
         };
         render::draw(cr, area_all.allocated_width(), area_all.allocated_height(), &state, &main_theme);
         glib::Propagation::Proceed
@@ -264,17 +324,42 @@ fn build_monitor_window(
         let s_area = scan_area.clone();
         let s_theme = theme.clone();
         let s_phase = scan_phase.clone();
+        let s_tile = scan_tile.clone();
+        let s_cursor = cursor_on.clone();
+        let s_glitch = glitch_on.clone();
+        let s_quote = quote.clone();
+        let s_typer = typewriter_chars.clone();
         scan_area.connect_draw(move |_, cr| {
-            // Clear to fully transparent first, then only paint the bands.
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
-            cr.paint().ok();
-            render::draw_scanline_layer(
-                cr,
-                s_area.allocated_width(),
-                s_area.allocated_height(),
-                &s_theme,
-                s_phase.get(),
-            );
+            let tw = s_area.allocated_width();
+            let th = s_area.allocated_height();
+            // (Re)build the pattern tile only when the size changed; the tile
+            // is a plain alpha strip so per-frame work is a single repeat-paint.
+            if s_tile
+                .borrow()
+                .as_ref()
+                .map(|(w, h, _)| *w != tw as usize || *h != th as usize)
+                .unwrap_or(true)
+            {
+                *s_tile.borrow_mut() = render::scanline_tile(&s_theme, tw, th)
+                    .map(|t| (tw as usize, th as usize, t));
+            }
+            if let Some((_, _, tile)) = s_tile.borrow().as_ref() {
+                render::draw_scanline_tile(cr, &s_theme, s_phase.get(), tile);
+            }
+            // The blinking terminal caret rides this overlay: it is a single
+            // small rect fill per frame, so its ~2 Hz blink costs nothing on
+            // the heavy text/glow layer.  Hidden during a glitch burst.
+            if s_cursor.get() && !s_glitch.get() {
+                let qb = s_quote.borrow();
+                if let Some((cx, cy, cw, ch)) = render::cursor_rect(
+                    cr, &s_theme, &qb.text, &qb.author, s_typer.get(), tw as f64, th as f64,
+                ) {
+                    let (r, g, b) = s_theme.author_ink;
+                    cr.set_source_rgba(r, g, b, 0.9);
+                    cr.rectangle(cx, cy, cw, ch);
+                    let _ = cr.fill();
+                }
+            }
             glib::Propagation::Proceed
         });
     }
@@ -288,15 +373,30 @@ fn build_monitor_window(
         });
     }
 
+    // The caret blinks on the scanline overlay when there is a compositor;
+    // otherwise it is drawn on the main layer (gated by `DrawState.cursor_on`).
+    arm_cursor_blink(
+        &area,
+        animated.then_some(&scan_area),
+        &cursor_on,
+    );
+
     MonitorWindow {
         window,
         area,
         scan_area,
+        scan_tile,
         quote,
         glitch_on,
         glitch_dx,
         glitch_dy,
+        glitch_invert,
+        glitch_ghost,
+        glitch_echo_px,
         scan_phase,
+        typewriter_chars,
+        typewriter_token,
+        cursor_on,
     }
 }
 
@@ -311,66 +411,234 @@ fn monitor_index_at((x, y): (i32, i32)) -> Option<i32> {
     })
 }
 
-/// Arm a glitch burst `random(2s..12s)` from now.  On fire: random displacement,
-/// queue a redraw, hold the burst for `glitch_ms`, then release and re-arm.
+/// Arm a glitch burst `random(2s..12s)` from now.  On fire, run a multi-step
+/// burst (see `run_glitch_burst`), then re-arm with a fresh random delay.
 fn arm_glitch_timer(
     area: &DrawingArea,
     glitch_on: &Rc<Cell<bool>>,
     glitch_dx: &Rc<Cell<f64>>,
     glitch_dy: &Rc<Cell<f64>>,
+    glitch_invert: &Rc<Cell<bool>>,
+    glitch_ghost: &Rc<Cell<bool>>,
+    glitch_echo_px: &Rc<Cell<f64>>,
     glitch_ms: u64,
+    intensity: f64,
 ) {
     let area = area.clone();
     let glitch_on = glitch_on.clone();
     let glitch_dx = glitch_dx.clone();
     let glitch_dy = glitch_dy.clone();
+    let glitch_invert = glitch_invert.clone();
+    let glitch_ghost = glitch_ghost.clone();
+    let glitch_echo_px = glitch_echo_px.clone();
 
     let mut rng = rand::thread_rng();
     let delay_ms = rng.gen_range(2000..=12_000);
     glib::timeout_add_local(std::time::Duration::from_millis(delay_ms), move || {
-        let mut rng = rand::thread_rng();
-        glitch_dx.set(rng.gen_range(-1.0..=1.0));
-        glitch_dy.set(rng.gen_range(-1.0..=1.0));
-        glitch_on.set(true);
-        area.queue_draw();
+        run_glitch_burst(
+            &area,
+            &glitch_on,
+            &glitch_dx,
+            &glitch_dy,
+            &glitch_invert,
+            &glitch_ghost,
+            &glitch_echo_px,
+            glitch_ms,
+            intensity,
+        );
+        glib::ControlFlow::Break
+    });
+}
 
-        let hold_ms = glitch_ms.max(150);
-        let area = area.clone();
-        let glitch_on = glitch_on.clone();
-        let glitch_dx = glitch_dx.clone();
-        let glitch_dy = glitch_dy.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(hold_ms), move || {
-            glitch_on.set(false);
+/// One glitch burst, mirroring the HTML `glitch-full` keyframes: the whole
+/// text block swings left/right in wide steps with cyan/magenta chromatic
+/// echoes, occasional white invert flashes, and blank strobing frames.  The
+/// burst lasts ~`glitch_ms`; the last few steps ease back to the origin so
+/// the text settles instead of snapping.
+const GLITCH_STEP_MS: u64 = 55;
+
+fn run_glitch_burst(
+    area: &DrawingArea,
+    glitch_on: &Rc<Cell<bool>>,
+    glitch_dx: &Rc<Cell<f64>>,
+    glitch_dy: &Rc<Cell<f64>>,
+    glitch_invert: &Rc<Cell<bool>>,
+    glitch_ghost: &Rc<Cell<bool>>,
+    glitch_echo_px: &Rc<Cell<f64>>,
+    glitch_ms: u64,
+    intensity: f64,
+) {
+    let steps = (glitch_ms / GLITCH_STEP_MS).max(6);
+    let half = steps / 2;
+    let remaining = Rc::new(Cell::new(steps));
+
+    let area = area.clone();
+    let glitch_on = glitch_on.clone();
+    let glitch_dx = glitch_dx.clone();
+    let glitch_dy = glitch_dy.clone();
+    let glitch_invert = glitch_invert.clone();
+    let glitch_ghost = glitch_ghost.clone();
+    let glitch_echo_px = glitch_echo_px.clone();
+    glitch_on.set(true);
+
+    glib::timeout_add_local(std::time::Duration::from_millis(GLITCH_STEP_MS), move || {
+        let mut rng = rand::thread_rng();
+        let k = remaining.get();
+        if k == 0 {
+            // burst over — settle and re-arm the next random bomb
+            glitch_invert.set(false);
+            glitch_ghost.set(false);
+            glitch_echo_px.set(0.0);
             glitch_dx.set(0.0);
             glitch_dy.set(0.0);
+            glitch_on.set(false);
             area.queue_draw();
-            glib::ControlFlow::Break
-        });
+            arm_glitch_timer(
+                &area,
+                &glitch_on,
+                &glitch_dx,
+                &glitch_dy,
+                &glitch_invert,
+                &glitch_ghost,
+                &glitch_echo_px,
+                glitch_ms,
+                intensity,
+            );
+            return glib::ControlFlow::Break;
+        }
+        remaining.set(k - 1);
+
+        // displacement: full swings in the middle, easing near the end so the
+        // text settles back to center instead of teleporting.
+        let amp = 20.0 + 60.0 * intensity;
+        let d = if k <= 3 {
+            rng.gen_range(-16.0..=16.0)
+        } else {
+            let m = amp * rng.gen_range(0.6..=1.0);
+            if rng.gen_bool(0.5) { m } else { -m }
+        };
+        glitch_dx.set(d);
+        glitch_dy.set(rng.gen_range(-6.0..=6.0));
+
+        // chromatic echoes most steps, dropped sometimes for variety
+        if rng.gen_bool(0.75) {
+            glitch_echo_px.set(amp * rng.gen_range(1.0..=1.8));
+        } else {
+            glitch_echo_px.set(0.0);
+        }
+
+        // flicker: blank strobe every 4th step, invert flash every 5th
+        if k % 4 == 0 {
+            glitch_ghost.set(rng.gen_bool(0.7));
+        } else {
+            glitch_ghost.set(false);
+        }
+        if k % 5 == 0 {
+            glitch_invert.set(rng.gen_bool(0.6));
+        } else {
+            glitch_invert.set(false);
+        }
+        if k == half {
+            glitch_invert.set(true);
+        }
+        area.queue_draw();
         glib::ControlFlow::Continue
     });
 }
 
 /// Rotate the quote on this window every `cycle_minutes` minutes (source stays
-/// armed forever — `timeout_add_seconds` re-arms automatically).
-fn arm_cycle_timer(area: &DrawingArea, quote: &Rc<RefCell<Quote>>, pool: &Rc<Vec<Quote>>, cycle_minutes: u32) {
+/// armed forever — `timeout_add_seconds` re-arms automatically).  Each swap
+/// restarts the one-shot typewriter reveal for the new phrase.
+fn arm_cycle_timer(
+    area: &DrawingArea,
+    quote: &Rc<RefCell<Quote>>,
+    pool: &Rc<Vec<Quote>>,
+    cycle_minutes: u32,
+    typewriter_chars: &Rc<Cell<usize>>,
+    typewriter_token: &Rc<Cell<u64>>,
+) {
     let area = area.clone();
     let quote = quote.clone();
     let pool = pool.clone();
+    let tw_chars = typewriter_chars.clone();
+    let tw_token = typewriter_token.clone();
     glib::timeout_add_seconds_local((cycle_minutes * 60) as u32, move || {
         let mut rng = rand::thread_rng();
         if !pool.is_empty() {
             let i = rng.gen_range(0..pool.len());
-            let mut q = quote.borrow_mut();
-            q.text.clone_from(&pool[i].text);
-            q.author.clone_from(&pool[i].author);
+            {
+                let mut q = quote.borrow_mut();
+                q.text.clone_from(&pool[i].text);
+                q.author.clone_from(&pool[i].author);
+            }
+            start_typewriter(&area, &quote, &tw_chars, &tw_token);
             area.queue_draw();
         }
         glib::ControlFlow::Continue
     });
 }
 
+/// One char per ~`TYPEWRITER_MS_PER_CHAR` until the whole phrase is revealed —
+/// a one-shot animation that never repeats for the same quote.  A generation
+/// token lets the next phrase silently retire any stale timer.
+const TYPEWRITER_MS_PER_CHAR: u64 = 30;
+
+fn start_typewriter(
+    area: &DrawingArea,
+    quote: &Rc<RefCell<Quote>>,
+    chars: &Rc<Cell<usize>>,
+    token: &Rc<Cell<u64>>,
+) {
+    let total = quote.borrow().text.chars().count();
+    let gen = token.get() + 1;
+    token.set(gen);
+    chars.set(0);
+
+    if total == 0 {
+        return;
+    }
+
+    let area = area.clone();
+    let chars = chars.clone();
+    let token = token.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(TYPEWRITER_MS_PER_CHAR), move || {
+        if token.get() != gen {
+            return glib::ControlFlow::Break; // superseded by a newer phrase
+        }
+        let n = chars.get() + 1;
+        if n >= total {
+            chars.set(total);
+            area.queue_draw();
+            return glib::ControlFlow::Break; // reveal finished — one-shot done
+        }
+        chars.set(n);
+        area.queue_draw();
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Toggle the terminal caret blink phase every `CURSOR_BLINK_MS` (a classic
+/// ~1.9 Hz terminal timing).  With an RGBA compositor the caret lives on the
+/// scanline overlay, whose repaint this ticker also triggers — the heavy
+/// text/glow layer is never redrawn by the blink.  Without a compositor the
+/// main layer owns the caret and gets the redraw instead (rare fallback).
+const CURSOR_BLINK_MS: u64 = 530;
+
+fn arm_cursor_blink(area: &DrawingArea, overlay: Option<&DrawingArea>, cursor_on: &Rc<Cell<bool>>) {
+    let area = area.clone();
+    let overlay = overlay.cloned();
+    let cursor_on = cursor_on.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(CURSOR_BLINK_MS), move || {
+        cursor_on.set(!cursor_on.get());
+        match &overlay {
+            Some(ov) => ov.queue_draw(),
+            None => area.queue_draw(),
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
 /// Roll the scanline mesh continuously from the top edge toward the bottom.
-///
 /// One full screen-height sweep takes `SCAN_SWEEP_SECS` (matches the HTML
 /// version's `--scanline-speed: 90s`), redrawn at ~20 fps.  The per-frame work
 /// is only the overlay's ~`lines` thin bands — the text/glow layer is not
@@ -382,14 +650,15 @@ fn arm_scan_timer(area: &DrawingArea, phase: &Rc<Cell<f64>>, h: f64, lines: u32)
     if lines == 0 || h <= 0.0 {
         return;
     }
-    let spacing = (h / lines as f64).max(2.0);
+    // Wrap on the integer pattern period so it matches the tile exactly.
+    let period = render::scanline_tile_height(h, lines);
     let delta = h / (SCAN_SWEEP_SECS * (1000.0 / SCAN_ANIM_MS as f64));
 
     let area = area.clone();
     let phase = phase.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(SCAN_ANIM_MS), move || {
         let p = phase.get() + delta;
-        phase.set(if p >= spacing { p - spacing } else { p });
+        phase.set(if p >= period { p - period } else { p });
         area.queue_draw();
         glib::ControlFlow::Continue
     });

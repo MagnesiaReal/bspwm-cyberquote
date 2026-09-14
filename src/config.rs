@@ -27,6 +27,7 @@
 //!   │ accent:                                                         │
 //!   │   cyan: "#00ffff"                           # CSS hex color         │
 //!   │   magenta: "#ff00ff"                        # CSS hex color         │
+//!   │   author_color: "#ffa028"                 # author ink + caret     │
 //!   │   glitch_intensity: 0.35                    # 0.0-1.0               │
 //!   │   glitch_duration: 0.52                     # per-glitch seconds     │
 //!   │   glitch_interval: 6.5                      # seconds between glitch │
@@ -35,6 +36,11 @@
 //!   │   scanline_lines: 216                        # line+gap per screen   │
 //!   │   scanline_size_rem: 0.1                     # line thickness in rem │
 //!   │   crt_curvature: 0.12                       # screen bend factor    │
+//!   │   glow_radius: 6.0                          # text glow blur px      │
+//!   │   glow_alpha: 0.30                          # 0.0-1.0 glow opacity   │
+//!   │   glow_offset_x: 1.5                        # glow shift in px       │
+//!   │   glow_offset_y: 2.0                        # glow shift in px       │
+//!   │   glow_color: "#ffffff"                     # CSS hex color          │
 //!   │                                                                 │
 //!   │ quotes:                                                        │
 //!   │   source: "quotes.txt"                       # path or url          │
@@ -155,6 +161,8 @@ pub struct AccentConfig {
     pub magenta: String,
     #[serde(default = "AccentConfig::default_orange")]
     pub orange: String,
+    #[serde(default = "AccentConfig::default_author_color")]
+    pub author_color: String,
     #[serde(default = "AccentConfig::default_glitch_intensity")]
     pub glitch_intensity: f32,
     #[serde(default = "AccentConfig::default_glitch_duration")]
@@ -171,6 +179,16 @@ pub struct AccentConfig {
     pub scanline_size_rem: f32,
     #[serde(default = "AccentConfig::default_crt_curvature")]
     pub crt_curvature: f32,
+    #[serde(default = "AccentConfig::default_glow_radius")]
+    pub glow_radius: f32,
+    #[serde(default = "AccentConfig::default_glow_alpha")]
+    pub glow_alpha: f32,
+    #[serde(default = "AccentConfig::default_glow_offset_x")]
+    pub glow_offset_x: f32,
+    #[serde(default = "AccentConfig::default_glow_offset_y")]
+    pub glow_offset_y: f32,
+    #[serde(default = "AccentConfig::default_glow_color")]
+    pub glow_color: String,
 }
 
 impl AccentConfig {
@@ -179,6 +197,7 @@ impl AccentConfig {
             cyan: Self::default_cyan(),
             magenta: Self::default_magenta(),
             orange: Self::default_orange(),
+            author_color: Self::default_author_color(),
             glitch_intensity: Self::default_glitch_intensity(),
             glitch_duration: Self::default_glitch_duration(),
             glitch_interval: Self::default_glitch_interval(),
@@ -187,6 +206,11 @@ impl AccentConfig {
             scanline_lines: Self::default_scanline_lines(),
             scanline_size_rem: Self::default_scanline_size_rem(),
             crt_curvature: Self::default_crt_curvature(),
+            glow_radius: Self::default_glow_radius(),
+            glow_alpha: Self::default_glow_alpha(),
+            glow_offset_x: Self::default_glow_offset_x(),
+            glow_offset_y: Self::default_glow_offset_y(),
+            glow_color: Self::default_glow_color(),
         }
     }
     fn default_cyan() -> String {
@@ -198,6 +222,9 @@ impl AccentConfig {
     fn default_orange() -> String {
         "#ffe3b3".into()
     }
+    fn default_author_color() -> String {
+        "#ffa028".into()
+    }
     fn default_glitch_intensity() -> f32 {
         0.35
     }
@@ -208,7 +235,7 @@ impl AccentConfig {
         6.5
     }
     fn default_scanline_opacity() -> f32 {
-        0.30
+        0.20
     }
     fn default_scanline_steps() -> u32 {
         2160
@@ -221,6 +248,21 @@ impl AccentConfig {
     }
     fn default_crt_curvature() -> f32 {
         0.12
+    }
+    fn default_glow_radius() -> f32 {
+        6.0
+    }
+    fn default_glow_alpha() -> f32 {
+        0.30
+    }
+    fn default_glow_offset_x() -> f32 {
+        1.5
+    }
+    fn default_glow_offset_y() -> f32 {
+        2.0
+    }
+    fn default_glow_color() -> String {
+        "#ffffff".into()
     }
 }
 
@@ -636,6 +678,7 @@ foreground_color = "#ff5cf0"
 cyan = "#00ffcc"
 magenta = "#ff0088"
 orange = "#ffb347"
+author_color = "#ffa028"
 glitch_intensity = 0.45
 glitch_duration = 0.30
 glitch_interval = 4.0
@@ -644,6 +687,11 @@ scanline_steps = 120
 scanline_lines = 360
 scanline_size_rem = 0.07
 crt_curvature = 0.18
+glow_radius = 9.0
+glow_alpha = 0.22
+glow_offset_x = 2.0
+glow_offset_y = 3.0
+glow_color = "#ffffff"
 
 [quotes]
 source = "~/quotes.txt"
@@ -671,6 +719,7 @@ primary_only = true
         assert_eq!(c.accent.cyan, "#00ffcc");
         assert_eq!(c.accent.magenta, "#ff0088");
         assert_eq!(c.accent.orange, "#ffb347");
+        assert_eq!(c.accent.author_color, "#ffa028");
         assert!((c.accent.glitch_intensity - 0.45).abs() < 0.01);
         assert!((c.accent.glitch_duration - 0.30).abs() < 0.01);
         assert!((c.accent.glitch_interval - 4.0).abs() < 0.01);
@@ -679,6 +728,11 @@ primary_only = true
         assert_eq!(c.accent.scanline_lines, 360);
         assert!((c.accent.scanline_size_rem - 0.07).abs() < 0.01);
         assert!((c.accent.crt_curvature - 0.18).abs() < 0.01);
+        assert!((c.accent.glow_radius - 9.0).abs() < 0.01);
+        assert!((c.accent.glow_alpha - 0.22).abs() < 0.01);
+        assert!((c.accent.glow_offset_x - 2.0).abs() < 0.01);
+        assert!((c.accent.glow_offset_y - 3.0).abs() < 0.01);
+        assert_eq!(c.accent.glow_color, "#ffffff");
 
         assert_eq!(c.quotes.source, "~/quotes.txt");
         assert_eq!(c.quotes.cycle_interval_minutes, 8);
@@ -699,6 +753,7 @@ primary_only = true
         assert_eq!(c.display.foreground_color, DisplayConfig::default_foreground_color());
         assert_eq!(c.accent.cyan, AccentConfig::default_cyan());
         assert_eq!(c.accent.magenta, AccentConfig::default_magenta());
+        assert_eq!(c.accent.author_color, AccentConfig::default_author_color());
         assert!((c.accent.glitch_intensity - AccentConfig::default_glitch_intensity()).abs() < 0.01);
         assert!((c.accent.glitch_duration - AccentConfig::default_glitch_duration()).abs() < 0.01);
         assert!((c.accent.glitch_interval - AccentConfig::default_glitch_interval()).abs() < 0.01);
@@ -707,6 +762,11 @@ primary_only = true
         assert_eq!(c.accent.scanline_lines, AccentConfig::default_scanline_lines());
         assert!((c.accent.scanline_size_rem - AccentConfig::default_scanline_size_rem()).abs() < 0.01);
         assert!((c.accent.crt_curvature - AccentConfig::default_crt_curvature()).abs() < 0.01);
+        assert!((c.accent.glow_radius - AccentConfig::default_glow_radius()).abs() < 0.01);
+        assert!((c.accent.glow_alpha - AccentConfig::default_glow_alpha()).abs() < 0.01);
+        assert!((c.accent.glow_offset_x - AccentConfig::default_glow_offset_x()).abs() < 0.01);
+        assert!((c.accent.glow_offset_y - AccentConfig::default_glow_offset_y()).abs() < 0.01);
+        assert_eq!(c.accent.glow_color, AccentConfig::default_glow_color());
         assert_eq!(c.quotes.source, QuotesConfig::default_source());
         assert_eq!(c.quotes.cycle_interval_minutes, QuotesConfig::default_cycle_interval_minutes());
         assert_eq!(c.quotes.picker, QuotesConfig::default_picker());
