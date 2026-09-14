@@ -1,0 +1,34 @@
+# bspwm-cyberquote — default configuration
+# Place at: ~/.config/bspwm-cyberquote/config.toml
+# (Agent 1 declares CONFIG_PATH = /etc/bspwm-cyberquote/config.toml for the
+#  system-wide path; override the path in main.rs if you prefer a per-user file.)
+
+[display]
+font = "JetBrains Mono, monospace"
+font_size = 37
+opacity = 0.96
+background_color = "#05070d"
+foreground_color = "#ffffff"
+
+[accent]
+cyan = "#39e6ff"
+magenta = "#ff3de6"
+orange = "#ffe3b3"
+glitch_intensity = 0.35
+glitch_duration = 0.5
+glitch_interval = 6.5
+scanline_opacity = 0.30
+scanline_steps = 2160
+scanline_lines = 216
+scanline_size_rem = 0.1
+crt_curvature = 0.15
+
+[quotes]
+# Relative to the working directory, or an absolute path.
+source = "quotes.json"
+cycle_interval_minutes = 0
+picker = "random"
+
+[monitors]
+behavior = "one_per_monitor"
+primary_only = false

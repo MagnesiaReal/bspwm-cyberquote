@@ -1,0 +1,26 @@
+[package]
+name = "bspwm-cyberquote-native"
+version = "0.1.0"
+edition = "2021"
+description = "Native (Cairo/Pango) fork of bspwm-cyberquote — desktop quote ticker with no WebView."
+
+[lib]
+name = "bspwm_cyberquote"
+
+[dependencies]
+gtk = "0.18"
+glib = "0.18"
+pangocairo = "0.18"
+cairo-rs = { version = "0.18", features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+rand = "0.8"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
