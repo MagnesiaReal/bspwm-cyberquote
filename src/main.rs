@@ -151,6 +151,11 @@ fn build_windows(app: &Application) {
         orange: render::hex_color(&cfg.accent.orange),
         font_family: first_font_family(&cfg.display.font),
         font_px: cfg.display.font_size.max(8.0) as f64,
+        author_font_px: {
+            let raw = cfg.display.author_font_size;
+            (if raw > 0.0 { raw } else { cfg.display.font_size }).max(8.0) as f64
+        },
+        text_alignment: render::text_alignment(&cfg.display.text_alignment),
         scanline_alpha: cfg.accent.scanline_opacity.clamp(0.0, 1.0) as f64,
         scanline_lines: cfg.accent.scanline_lines,
         animated_scanlines: false, // flipped per-window once RGBA is probed
@@ -337,6 +342,7 @@ fn build_monitor_window(
     let glitch_ghost = Rc::new(Cell::new(false));
     let glitch_echo_px = Rc::new(Cell::new(0.0f64));
     let glow_cache = Rc::new(RefCell::new(render::GlowCache::new()));
+    let text_cache = Rc::new(RefCell::new(render::TextSurfaceCache::new()));
 
     // Main layer draws its own static scanlines only when there is no RGBA
     // compositor to host the animated overlay (avoids double-darkening).
@@ -356,9 +362,11 @@ fn build_monitor_window(
     let cursor_on_draw = cursor_on.clone();
     let area_all = area.clone();
     let glow_draw = glow_cache.clone();
+    let text_draw = text_cache.clone();
     area.connect_draw(move |_, cr| {
         let q = q.borrow();
         let mut glow = glow_draw.borrow_mut();
+        let mut tc = text_draw.borrow_mut();
         let mut state = render::DrawState {
             quote: &q,
             glitch: g_on.get(),
@@ -370,6 +378,7 @@ fn build_monitor_window(
             typewriter: typer.get(),
             cursor_on: cursor_on_draw.get(),
             glow: Some(&mut glow),
+            text_cache: Some(&mut tc),
         };
         render::draw(cr, area_all.allocated_width(), area_all.allocated_height(), &mut state, &main_theme);
         glib::Propagation::Proceed

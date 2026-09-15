@@ -127,6 +127,15 @@ pub struct DisplayConfig {
     pub font: String,
     #[serde(default = "DisplayConfig::default_font_size")]
     pub font_size: f32,
+    /// Author (attribution) font size in CSS px.  When omitted or zero the
+    /// quote `font_size` is used, so the default behaviour is unchanged.
+    #[serde(default)]
+    pub author_font_size: f32,
+    /// Text alignment of the quote/author lines *within* the centered block:
+    /// `"left"`, `"right"` or `"center"` (default).  The text block stays
+    /// centered on the screen; this only controls how each line is justified.
+    #[serde(default = "DisplayConfig::default_text_alignment")]
+    pub text_alignment: String,
     #[serde(default = "DisplayConfig::default_opacity")]
     pub opacity: f32,
     #[serde(default = "DisplayConfig::default_background_color")]
@@ -140,6 +149,8 @@ impl DisplayConfig {
         Self {
             font: Self::default_font(),
             font_size: Self::default_font_size(),
+            author_font_size: 0.0,
+            text_alignment: Self::default_text_alignment(),
             opacity: Self::default_opacity(),
             background_color: Self::default_background_color(),
             foreground_color: Self::default_foreground_color(),
@@ -150,6 +161,9 @@ impl DisplayConfig {
     }
     fn default_font_size() -> f32 {
         18.0
+    }
+    fn default_text_alignment() -> String {
+        "center".into()
     }
     fn default_opacity() -> f32 {
         0.98
@@ -755,6 +769,8 @@ mod tests {
 [display]
 font = "Hack, monospace"
 font_size = 22
+author_font_size = 16
+text_alignment = "right"
 opacity = 0.92
 background_color = "#050508"
 foreground_color = "#ff5cf0"
@@ -804,6 +820,8 @@ primary_only = true
         let c = parsed_config();
         assert_eq!(c.display.font, "Hack, monospace");
         assert!((c.display.font_size - 22.0).abs() < 0.01);
+        assert!((c.display.author_font_size - 16.0).abs() < 0.01);
+        assert_eq!(c.display.text_alignment, "right");
         assert!((c.display.opacity - 0.92).abs() < 0.01);
         assert_eq!(c.display.background_color, "#050508");
         assert_eq!(c.display.foreground_color, "#ff5cf0");
@@ -879,6 +897,9 @@ primary_only = true
         let c = toml::from_str::<Config>(partial).unwrap();
         assert_eq!(c.display.font, DisplayConfig::default_font());
         assert!((c.display.font_size - 14.0).abs() < 0.01);
+        // author_font_size is optional: omitted means 0 → falls back to font_size.
+        assert_eq!(c.display.author_font_size, 0.0);
+        assert_eq!(c.display.text_alignment, DisplayConfig::default_text_alignment());
         assert!((c.display.opacity - DisplayConfig::default_opacity()).abs() < 0.01);
     }
 

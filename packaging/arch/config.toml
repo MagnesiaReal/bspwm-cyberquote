@@ -6,6 +6,10 @@
 [display]
 font = "JetBrains Mono, monospace"
 font_size = 37
+# Optional: author (attribution) font size in px.  Omit to match font_size.
+# author_font_size = 24
+# Text justification within the centered block: "left" | "center" (default) | "right"
+# text_alignment = "center"
 opacity = 0.96
 background_color = "#05070d"
 foreground_color = "#ffffff"

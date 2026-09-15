@@ -44,6 +44,11 @@ pub struct Theme {
     pub font_family: String,
     /// Body font size in CSS px.
     pub font_px: f64,
+    /// Author (attribution) font size in CSS px.  When equal to `font_px` both
+    /// texts use the same size (the historical default).
+    pub author_font_px: f64,
+    /// How each line is justified inside the (screen-centered) text block.
+    pub text_alignment: pango::Alignment,
     /// Scanline darkness 0..1.
     pub scanline_alpha: f64,
     /// Scanline density: lines per screen height.
@@ -98,6 +103,33 @@ impl GlowCache {
     }
 }
 
+/// Cache for the pre-rendered steady-state text block (glow + quote + author).
+///
+/// When the phrase, window size, font, or colours change the cache is rebuilt
+/// once; every subsequent steady-state frame blits the stored surface with a
+/// single `paint()` instead of recreating Pango layouts, rasterizing text, and
+/// compositing the glow halo.  A glitch burst or typewriter reveal bypasses the
+/// cache entirely and renders the old way; when they end the cache is rebuilt.
+pub struct TextSurfaceCache {
+    key: (u64, String, String, String, u64, u32, u32, u32, u32, u32, u32, u32),
+    surface: Option<cairo::ImageSurface>,
+    /// Top-left of the cached region in window coordinates.
+    surface_pos: (f64, f64),
+    /// Cached cursor rect `(cx, cy, cw, ch)` for the no-compositor fallback.
+    cursor_rect: Option<(f64, f64, f64, f64)>,
+}
+
+impl TextSurfaceCache {
+    pub fn new() -> Self {
+        Self {
+            key: (0, String::new(), String::new(), String::new(), 0, 0, 0, 0, 0, 0, 0, 0),
+            surface: None,
+            surface_pos: (0.0, 0.0),
+            cursor_rect: None,
+        }
+    }
+}
+
 /// Per-draw dynamic state.
 pub struct DrawState<'a> {
     /// The quote to paint.
@@ -129,6 +161,9 @@ pub struct DrawState<'a> {
     /// Mutable cache for the static glow halo (see [`GlowCache`]). `None`
     /// disables the cached glow pipeline entirely (no halo is drawn).
     pub glow: Option<&'a mut GlowCache>,
+    /// Mutable cache for the steady-state text block surface (see
+    /// [`TextSurfaceCache`]). `None` disables the cached text pipeline entirely.
+    pub text_cache: Option<&'a mut TextSurfaceCache>,
 }
 
 /// Parse a `"#rrggbb"` hex string into an RGB tuple.
@@ -139,6 +174,42 @@ pub fn hex_color(s: &str) -> (f64, f64, f64) {
     let g = ((v >> 8) & 0xff) as f64 / 255.0;
     let b = (v & 0xff) as f64 / 255.0;
     (r, g, b)
+}
+
+/// Map a config alignment string (`"left"`, `"right"`, `"center"`) to a Pango
+/// alignment.  Unknown or missing values fall back to Center — the historical
+/// default and the current look.
+pub fn text_alignment(s: &str) -> pango::Alignment {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "left" => pango::Alignment::Left,
+        "right" => pango::Alignment::Right,
+        _ => pango::Alignment::Center,
+    }
+}
+
+/// Compact a `pango::Alignment` into a few bits for the text-surface cache key.
+fn alignment_bits(a: pango::Alignment) -> u64 {
+    match a {
+        pango::Alignment::Left   => 1,
+        pango::Alignment::Center => 2,
+        pango::Alignment::Right  => 3,
+        _                        => 0,
+    }
+}
+
+/// Horizontal position of the author line.  For centered text the author is
+/// independently centered at `w/2`.  For left/right justification it anchors
+/// to the quote block's visual left/right edge, so the attribution rides along
+/// with the justified quote instead of drifting back to screen-center.
+///
+/// Params: quote ink width (`iw`), author ink left-overhang (`aink_x`) and ink
+/// width (`aw`).
+fn author_x(align: pango::Alignment, w: f64, iw: f64, aink_x: f64, aw: f64) -> f64 {
+    match align {
+        pango::Alignment::Left => w / 2.0 - iw / 2.0 - aink_x,
+        pango::Alignment::Right => w / 2.0 + iw / 2.0 - aink_x - aw,
+        _ => w / 2.0 - aink_x - aw / 2.0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,13 +261,61 @@ fn draw_text_block(
 ) -> (f64, f64) {
     let wrap = (w * WRAP_FRACTION).max(120.0);
 
-    let quote_layout = make_layout(cr, theme, &state.quote.text, wrap);
-    let author_layout = make_layout(cr, theme, &format!("— {}", state.quote.author), wrap);
+    let total_chars = state.quote.text.chars().count();
+    let typed = state.typewriter.min(total_chars);
+    let typing = typed < total_chars;
 
-    // Center on what is actually *painted* (ink), not on Pango's logical
-    // width: `pixel_size` can return a box whose ink starts/overhangs
-    // asymmetrically (observed +43 px right-shift inside the logical box),
-    // which pushes the visible text off center.
+    // ---- Text surface cache key (everything that affects the steady-state block) ----
+    let fg = theme.fg;
+    let ai = theme.author_ink;
+    let gi = (theme.glow_intensity * 1000.0).round() as u32;
+    let dims = ((w as u64) << 32) | (h as u64);
+    let fonts = ((theme.font_px * 100.0).round() as u64) << 32
+        | (theme.author_font_px * 100.0).round() as u64
+        | (alignment_bits(theme.text_alignment) << 56);
+    let text_key = (
+        dims,
+        state.quote.text.clone(),
+        state.quote.author.clone(),
+        theme.font_family.clone(),
+        fonts,
+        (fg.0 * 1000.0) as u32,
+        (fg.1 * 1000.0) as u32,
+        (fg.2 * 1000.0) as u32,
+        (ai.0 * 1000.0) as u32,
+        (ai.1 * 1000.0) as u32,
+        (ai.2 * 1000.0) as u32,
+        gi,
+    );
+
+    // ---- Cache hit: blit the pre-rendered surface and bail out ----
+    if !state.glitch && !typing {
+        if let Some(tc) = state.text_cache.as_deref() {
+            if tc.key == text_key {
+                if let Some(surf) = &tc.surface {
+                    cr.save();
+                    cr.set_source_surface(surf, tc.surface_pos.0, tc.surface_pos.1);
+                    cr.paint();
+                    cr.restore();
+                    // Cursor (no-compositor fallback only)
+                    if theme.animated_scanlines && state.cursor_on {
+                        if let Some((cx, cy, cw, ch)) = tc.cursor_rect {
+                            let (crr, cgg, cbb) = theme.cursor_ink;
+                            cr.set_source_rgba(crr, cgg, cbb, 0.9);
+                            cr.rectangle(cx, cy, cw, ch);
+                            cr.fill();
+                        }
+                    }
+                    return (0.0, 0.0);
+                }
+            }
+        }
+    }
+
+    // ---- Cache miss or non-cacheable state: full render path ----
+    let quote_layout = make_layout(cr, theme, &state.quote.text, wrap, theme.font_px);
+    let author_layout = make_layout(cr, theme, &format!("— {}", state.quote.author), wrap, theme.author_font_px);
+
     let (qink, _qlog) = quote_layout.pixel_extents();
     let (aink, _alog) = author_layout.pixel_extents();
     let (iw, ih) = (qink.width() as f64, qink.height() as f64);
@@ -207,17 +326,9 @@ fn draw_text_block(
 
     let qx = w / 2.0 - qink.x() as f64 - iw / 2.0;
     let qy = top - qink.y() as f64;
-    let ax = w / 2.0 - aink.x() as f64 - aw / 2.0;
+    let ax = author_x(theme.text_alignment, w, iw, aink.x() as f64, aw);
     let ay = top + ih + BLOCK_GAP_PX - aink.y() as f64;
 
-    let total_chars = state.quote.text.chars().count();
-    let typed = state.typewriter.min(total_chars);
-    let typing = typed < total_chars;
-
-    // Glow is a *static* layer: the halo is pre-baked once per phrase into an
-    // ARGB surface (color/opacity baked in) and each frame is a single fast
-    // `paint()` blit — the budget hit happens once per phrase, never per frame.
-    // A glitch burst skips the blit for its whole duration.
     let glow_halo = if theme.glow_intensity > 0.01 {
         if let Some(gc) = state.glow.as_deref_mut() {
             let intensity_bits = (theme.glow_intensity * 1000.0).round() as u32;
@@ -243,12 +354,11 @@ fn draw_text_block(
         None
     };
 
+    // Track whether the author line was already composited into the cache
+    // surface so we don't draw it a second time on the frame.
+    let mut skip_author = false;
+
     if state.glitch {
-        // Full-text glitch burst (mirrors the HTML `glitch-full` keyframes):
-        // the whole block swings left/right with cyan/magenta echo copies,
-        // occasional white invert flashes and strobe blank frames. The static
-        // glow layer is deliberately *not* composited for the whole burst, so
-        // glitch frames never pay the glow cost; it reappears when it ends.
         let ox = qx + state.glitch_dx;
         let oy = qy + state.glitch_dy;
         if !state.glitch_ghost {
@@ -276,10 +386,6 @@ fn draw_text_block(
             }
         }
     } else if typing {
-        // One-shot typewriter reveal: clip the layout line-by-line to the
-        // caret of the next character so lines stay centered and stable
-        // while they appear left→right. The cached halo is composited inside
-        // the same clip, so it reveals in lockstep with the crisp text.
         let byte = char_byte_index(&state.quote.text, typed);
         cr.save();
         push_typewriter_clip(cr, &quote_layout, byte, qx, qy);
@@ -288,43 +394,149 @@ fn draw_text_block(
         }
         draw_text(cr, &quote_layout, qx, qy, theme.fg, 1.0);
         cr.restore();
-        // The main layer owns the caret only in the no-overlay fallback
-        // (`animated_scanlines` set); with a compositor the scanline overlay
-        // paints it instead.
         if theme.animated_scanlines && state.cursor_on {
             draw_terminal_cursor(cr, &quote_layout, qx, qy, byte, theme);
         }
     } else {
-        // Steady state: the cached static halo under the crisp text.
-        if let Some((halo, (lx, ly))) = glow_halo {
-            blit_glow_halo(cr, halo, lx, ly);
+        // Steady state: render the block into a cache surface, blit it, and
+        // store it for subsequent frames.
+        let glow_bounds = glow_halo.map(|(h, (lx, ly))| {
+            (
+                lx,
+                ly,
+                lx + h.width() as f64,
+                ly + h.height() as f64,
+            )
+        });
+        let quote_bounds = (
+            qx + qink.x() as f64,
+            qy + qink.y() as f64,
+            qx + qink.x() as f64 + iw,
+            qy + qink.y() as f64 + ih,
+        );
+        let author_bounds = (
+            ax + aink.x() as f64,
+            ay + aink.y() as f64,
+            ax + aink.x() as f64 + aw,
+            ay + aink.y() as f64 + ah,
+        );
+
+        let mut left = quote_bounds.0.min(author_bounds.0);
+        let mut top_y = quote_bounds.1.min(author_bounds.1);
+        let mut right = quote_bounds.2.max(author_bounds.2);
+        let mut bottom = quote_bounds.3.max(author_bounds.3);
+
+        if let Some((gl, gt, gr, gb)) = glow_bounds {
+            left = left.min(gl);
+            top_y = top_y.min(gt);
+            right = right.max(gr);
+            bottom = bottom.max(gb);
         }
-        draw_text(cr, &quote_layout, qx, qy, theme.fg, 1.0);
-        if theme.animated_scanlines && state.cursor_on {
-            draw_terminal_cursor(cr, &quote_layout, qx, qy, quote_layout.text().len(), theme);
+
+        let sw = (right - left).ceil() as i32;
+        let sh = (bottom - top_y).ceil() as i32;
+
+        let mut used_cache = false;
+        if sw > 0 && sh > 0 {
+            if let Ok(surf) = cairo::ImageSurface::create(cairo::Format::ARgb32, sw, sh) {
+                {
+                    let sc = cairo::Context::new(&surf).expect("text cache context");
+                    // Match the frame context's font options so the cached
+                    // surface rasterizes text identically to the direct path.
+                    if let Ok(fo) = cr.font_options() {
+                        sc.set_font_options(&fo);
+                    }
+                    sc.translate(-left, -top_y);
+                    if let Some((halo, (lx, ly))) = glow_halo {
+                        blit_glow_halo(&sc, halo, lx, ly);
+                    }
+                    draw_text(&sc, &quote_layout, qx, qy, theme.fg, 1.0);
+                    let (ar, ag, ab) = theme.author_ink;
+                    draw_text_fade_author(&sc, &author_layout, ax, ay, (ar, ag, ab));
+                }
+
+                // Blit to frame.
+                cr.save();
+                cr.set_source_surface(&surf, left, top_y);
+                cr.paint();
+                cr.restore();
+
+                // Cursor (no-compositor fallback)
+                if theme.animated_scanlines && state.cursor_on {
+                    draw_terminal_cursor(
+                        cr,
+                        &quote_layout,
+                        qx,
+                        qy,
+                        quote_layout.text().len(),
+                        theme,
+                    );
+                }
+
+                // Compute cursor rect for future cache blits.
+                let cursor_rect = if !theme.animated_scanlines {
+                    let byte = quote_layout.text().len();
+                    let rect = quote_layout.index_to_pos(byte as i32);
+                    let sc2 = pango::SCALE as f64;
+                    let cx = qx + rect.x() as f64 / sc2;
+                    let cy = qy + rect.y() as f64 / sc2;
+                    let cw = (rect.width() as f64 / sc2).clamp(2.0, theme.font_px * 0.7);
+                    let ch = (rect.height() as f64 / sc2).max(2.0);
+                    Some((cx, cy, cw, ch))
+                } else {
+                    None
+                };
+
+                if let Some(tc) = state.text_cache.as_deref_mut() {
+                    tc.key = text_key;
+                    tc.surface = Some(surf);
+                    tc.surface_pos = (left, top_y);
+                    tc.cursor_rect = cursor_rect;
+                }
+                used_cache = true;
+                skip_author = true;
+            }
+        }
+
+        // Fallback if surface creation failed.
+        if !used_cache {
+            if let Some((halo, (lx, ly))) = glow_halo {
+                blit_glow_halo(cr, halo, lx, ly);
+            }
+            draw_text(cr, &quote_layout, qx, qy, theme.fg, 1.0);
+            if theme.animated_scanlines && state.cursor_on {
+                draw_terminal_cursor(
+                    cr,
+                    &quote_layout,
+                    qx,
+                    qy,
+                    quote_layout.text().len(),
+                    theme,
+                );
+            }
         }
     }
 
     // The author line joins the animation only once the quote body is fully
     // revealed. A glitch ghost strobe blanks the whole block, author included.
-    // The author renders as a single crisp pass — no halo.
-    if !typing && !(state.glitch && state.glitch_ghost) {
+    // Skipped when the author was already composited into the cache surface.
+    if !skip_author && !typing && !(state.glitch && state.glitch_ghost) {
         let (ar, ag, ab) = theme.author_ink;
         draw_text_fade_author(cr, &author_layout, ax, ay, (ar, ag, ab));
     }
-    (qx, qy)
+    (0.0, 0.0)
 }
 
 /// Build a wrapped, centered Pango layout from a context.
-fn make_layout(cr: &cairo::Context, theme: &Theme, text: &str, wrap_px: f64) -> pango::Layout {
+fn make_layout(cr: &cairo::Context, theme: &Theme, text: &str, wrap_px: f64, font_px: f64) -> pango::Layout {
     let layout = pangocairo::create_layout(cr);
     let mut desc = pango::FontDescription::from_string(&theme.font_family);
     // CSS px → Pango size (Pango units are points * SCALE; 96 dpi ⇒ px * 0.75 pt)
-    let points = theme.font_px * 0.75;
+    let points = font_px * 0.75;
     desc.set_size((points * pango::SCALE as f64) as i32);
     layout.set_font_description(Some(&desc));
     layout.set_width((wrap_px * pango::SCALE as f64) as i32);
-    layout.set_alignment(pango::Alignment::Center);
+    layout.set_alignment(theme.text_alignment);
     layout.set_wrap(pango::WrapMode::WordChar);
     layout.set_text(text);
     layout
@@ -635,8 +847,8 @@ pub fn cursor_rect(
     h: f64,
 ) -> Option<(f64, f64, f64, f64)> {
     let wrap = (w * WRAP_FRACTION).max(120.0);
-    let quote_layout = make_layout(cr, theme, text, wrap);
-    let author_layout = make_layout(cr, theme, &format!("— {author}"), wrap);
+    let quote_layout = make_layout(cr, theme, text, wrap, theme.font_px);
+    let author_layout = make_layout(cr, theme, &format!("— {author}"), wrap, theme.author_font_px);
 
     let (qink, _) = quote_layout.pixel_extents();
     let (aink, _) = author_layout.pixel_extents();
@@ -812,6 +1024,8 @@ mod tests {
             orange: (1.0, 0.89, 0.70),
             font_family: "monospace".into(),
             font_px: 24.0,
+            author_font_px: 24.0,
+            text_alignment: pango::Alignment::Center,
             scanline_alpha: 0.3,
             scanline_lines: 100,
             animated_scanlines: false,
@@ -851,6 +1065,7 @@ mod tests {
             typewriter: test_quote().text.chars().count(),
             cursor_on: true,
             glow: None,
+            text_cache: None,
         };
         draw(&cr, w, h, &mut state, &theme);
 
@@ -876,6 +1091,7 @@ mod tests {
             typewriter: test_quote().text.chars().count(),
             cursor_on: true,
             glow: None,
+            text_cache: None,
         };
         {
             let cr = cairo::Context::new(&surf).expect("context");
@@ -920,6 +1136,7 @@ mod tests {
             typewriter: test_quote().text.chars().count(),
             cursor_on: true,
             glow: None,
+            text_cache: None,
         };
         {
             let cr = cairo::Context::new(&surf).expect("context");
@@ -964,6 +1181,7 @@ mod tests {
             typewriter: test_quote().text.chars().count(),
             cursor_on: true,
             glow: None,
+            text_cache: None,
         };
         {
             let cr = cairo::Context::new(&surf).expect("context");
@@ -1026,6 +1244,7 @@ mod tests {
                     typewriter: typed,
                     cursor_on: true,
                     glow: None,
+                    text_cache: None,
                 };
                 draw(&cr, w, h, &mut state, &theme);
             }
@@ -1076,6 +1295,7 @@ mod tests {
                     typewriter: typed,
                     cursor_on: true,
                     glow: None,
+                    text_cache: None,
                 };
                 draw(&cr, nw, nh, &mut state, &theme);
             }
@@ -1119,6 +1339,7 @@ mod tests {
                     typewriter: total.saturating_sub(1),
                     cursor_on,
                     glow: None,
+                    text_cache: None,
                 };
                 draw(&cr, w, h, &mut state, &theme);
             }
@@ -1181,6 +1402,7 @@ mod tests {
                     typewriter: test_quote().text.chars().count(),
                     cursor_on: false,
                     glow: Some(cache),
+                    text_cache: None,
                 };
                 draw(&cr, w, h, &mut state, &theme);
             }
@@ -1221,6 +1443,146 @@ mod tests {
         assert!(
             glitching <= no_glow + 20,
             "glitch frames must hide the glow layer ({glitching} halo px vs no-glow {no_glow} px)"
+        );
+    }
+
+    /// The text surface cache must reproduce the full (non-cached) render
+    /// pixel-for-pixel: first frame builds the surface, second frame blits it.
+    #[test]
+    fn text_surface_cache_matches_full_render() {
+        let (w, h) = (900, 400);
+        let base = test_theme();
+        let quote = test_quote();
+
+        fn render(
+            tc: Option<&mut TextSurfaceCache>,
+            q: &Quote,
+            w: i32,
+            h: i32,
+            theme: &Theme,
+        ) -> cairo::ImageSurface {
+            let mut s = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
+            {
+                let cr = cairo::Context::new(&s).expect("context");
+                let mut state = DrawState {
+                    quote: q,
+                    glitch: false,
+                    glitch_dx: 0.0,
+                    glitch_dy: 0.0,
+                    glitch_echo_px: 0.0,
+                    glitch_invert: false,
+                    glitch_ghost: false,
+                    typewriter: q.text.chars().count(),
+                    cursor_on: false,
+                    glow: None,
+                    text_cache: tc,
+                };
+                draw(&cr, w, h, &mut state, theme);
+            }
+            s
+        }
+
+        let mut full = render(None, &quote, w, h, &base);
+        let mut tc = TextSurfaceCache::new();
+        let mut build = render(Some(&mut tc), &quote, w, h, &base);
+        let mut blit = render(Some(&mut tc), &quote, w, h, &base);
+        assert_eq!(
+            build.data().expect("surface").to_vec(),
+            full.data().expect("surface").to_vec(),
+            "cache-build frame must equal the full render"
+        );
+        assert_eq!(
+            blit.data().expect("surface").to_vec(),
+            full.data().expect("surface").to_vec(),
+            "cache-blit frame must equal the full render"
+        );
+
+        // A different phrase must invalidate the cache and rebuild, not blit
+        // a stale surface.
+        let q2 = Quote {
+            text: "A longer, completely different phrase that wraps over multiple lines so the bounds math is exercised as well.".to_string(),
+            author: "Different Author".to_string(),
+        };
+        let mut tc = TextSurfaceCache::new();
+        let mut alt = render(Some(&mut tc), &q2, w, h, &base);
+        assert_ne!(
+            alt.data().expect("surface").to_vec(),
+            full.data().expect("surface").to_vec(),
+            "a different phrase must invalidate the text surface cache"
+        );
+    }
+
+    /// The `text_alignment` helper maps config strings to Pango enums, and
+    /// an unknown value falls back to Center.
+    #[test]
+    fn alignment_parse() {
+        assert_eq!(text_alignment("left"),  pango::Alignment::Left);
+        assert_eq!(text_alignment("right"), pango::Alignment::Right);
+        assert_eq!(text_alignment("center"), pango::Alignment::Center);
+        assert_eq!(text_alignment("LEFT"),   pango::Alignment::Left);
+        assert_eq!(text_alignment(""),       pango::Alignment::Center);
+        assert_eq!(text_alignment("bogus"),  pango::Alignment::Center);
+    }
+
+    /// Left vs right alignment must produce different pixel output — the same
+    /// centered block, but the text inside is justified differently.
+    #[test]
+    fn alignment_changes_output() {
+        let (w, h) = (900, 400);
+        let quote = test_quote();
+        let render = |align: pango::Alignment| -> cairo::ImageSurface {
+            let mut base = test_theme();
+            base.text_alignment = align;
+            let mut s = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("s");
+            {
+                let cr = cairo::Context::new(&s).expect("ctx");
+                let mut state = DrawState {
+                    quote: &quote,
+                    glitch: false, glitch_dx: 0.0, glitch_dy: 0.0,
+                    glitch_echo_px: 0.0, glitch_invert: false, glitch_ghost: false,
+                    typewriter: quote.text.chars().count(),
+                    cursor_on: false, glow: None, text_cache: None,
+                };
+                draw(&cr, w, h, &mut state, &base);
+            }
+            s
+        };
+        let mut left   = render(pango::Alignment::Left);
+        let mut center = render(pango::Alignment::Center);
+        let mut right  = render(pango::Alignment::Right);
+
+        assert_ne!(
+            left.data().expect("surface").to_vec(),
+            right.data().expect("surface").to_vec(),
+            "left vs right alignment must differ"
+        );
+        assert_ne!(
+            left.data().expect("surface").to_vec(),
+            center.data().expect("surface").to_vec(),
+            "left vs center alignment must differ"
+        );
+    }
+
+    /// The author anchors to the quote block's justified edge instead of being
+    /// re-centered: its visual left/right edge must coincide with the quote's.
+    #[test]
+    fn author_anchors_to_justified_quote() {
+        let (w, iw, aw) = (900.0, 400.0, 220.0);
+        let aink_x = 0.0;
+
+        let left = author_x(pango::Alignment::Left, w, iw, aink_x, aw);
+        assert!((left + aink_x - (w / 2.0 - iw / 2.0)).abs() < 1e-9, "author left edge == quote left edge");
+
+        let right = author_x(pango::Alignment::Right, w, iw, aink_x, aw);
+        assert!(
+            (right + aink_x + aw - (w / 2.0 + iw / 2.0)).abs() < 1e-9,
+            "author right edge == quote right edge"
+        );
+
+        let center = author_x(pango::Alignment::Center, w, iw, aink_x, aw);
+        assert!(
+            (center + aink_x + aw / 2.0 - w / 2.0).abs() < 1e-9,
+            "author stays centered for center alignment"
         );
     }
 }

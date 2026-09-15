@@ -6,6 +6,12 @@
 [display]
 font = "JetBrains Mono, monospace"
 font_size = 37
+# Optional: author (attribution) font size in px.  Omit to match font_size.
+author_font_size = 24
+# Text justification of the quote lines AND author inside the centered block:
+# "left" | "center" (default) | "right"
+# In left/right mode the author anchors to the quote's block edge.
+text_alignment = "left"
 opacity = 0.96
 background_color = "#05070d"
 foreground_color = "#ffffff"
@@ -16,8 +22,8 @@ author_color = "#F4E394"
 cursor_color = "#F4E394"
 scanline_opacity = 0.20
 scanline_steps = 2160
-scanline_lines = 216
-scanline_size_rem = 0.2
+scanline_lines = 208
+scanline_size_rem = 0.5
 crt_curvature = 0.15
 
 [glitch]
@@ -32,8 +38,8 @@ interval_max_seconds = 10.0
 [glow]
 enabled = true
 color = "#FFFFFF"
-radius = 15.0
-intensity = 0.48
+radius = 16.0
+intensity = 0.49
 thickness = 1.0
 
 [quotes]
