@@ -34,10 +34,10 @@ pub struct Theme {
     pub bg: (f64, f64, f64),
     /// Foreground (quote body) RGB.
     pub fg: (f64, f64, f64),
-    /// Accent cyan RGB (author ink + glitch split).
-    pub cyan: (f64, f64, f64),
-    /// Accent magenta RGB (glitch split).
-    pub magenta: (f64, f64, f64),
+    /// Glitch chromatic-echo color A RGB (the old `accent.cyan`; left echo).
+    pub color_a: (f64, f64, f64),
+    /// Glitch chromatic-echo color B RGB (the old `accent.magenta`; right echo).
+    pub color_b: (f64, f64, f64),
     /// Accent orange RGB (author accent fallback).
     pub orange: (f64, f64, f64),
     /// Pango font family string (e.g. "JetBrains Mono").
@@ -254,8 +254,8 @@ fn draw_text_block(
         if !state.glitch_ghost {
             let echo = state.glitch_echo_px;
             if echo > 0.5 {
-                draw_text(cr, &quote_layout, ox + echo, oy, theme.magenta, 0.85);
-                draw_text(cr, &quote_layout, ox - echo, oy, theme.cyan, 0.85);
+                draw_text(cr, &quote_layout, ox + echo, oy, theme.color_b, 0.85);
+                draw_text(cr, &quote_layout, ox - echo, oy, theme.color_a, 0.85);
             }
             if state.glitch_invert {
                 let pad2 = 16.0;
@@ -807,8 +807,8 @@ mod tests {
         Theme {
             bg: (0.02, 0.03, 0.05),
             fg: (1.0, 1.0, 1.0),
-            cyan: (0.22, 0.90, 1.0),
-            magenta: (1.0, 0.24, 0.87),
+            color_a: (0.22, 0.90, 1.0),
+            color_b: (1.0, 0.24, 0.87),
             orange: (1.0, 0.89, 0.70),
             font_family: "monospace".into(),
             font_px: 24.0,

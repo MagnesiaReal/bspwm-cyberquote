@@ -18,7 +18,7 @@
 //! reads the same `~/.config/bspwm-cyberquote/config.toml` and quote pool.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk::gdk;
@@ -40,13 +40,25 @@ type TileCache = Rc<RefCell<Option<(usize, usize, gtk::cairo::ImageSurface)>>>;
 // ---------------------------------------------------------------------------
 const CONFIG_PATH: &str = concat!(env!("HOME"), "/.config/bspwm-cyberquote/config.toml");
 
-/// Precedence: per-user CONFIG_PATH → repo `./config.toml` → defaults.
+/// System-wide default, shipped by the Arch package to `/etc`.
+const SYS_CONFIG_PATH: &str = "/etc/bspwm-cyberquote/config.toml";
+
+/// Precedence: per-user CONFIG_PATH → `/etc` default → repo `./config.toml` →
+/// defaults.  On first run (no user config yet) the `/etc` sample shipped by
+/// the package is copied into `~/.config` so the editable file lives there.
 fn load_cfg() -> Result<Config, (PathBuf, String)> {
-    let candidates: [PathBuf; 2] = [PathBuf::from(CONFIG_PATH), PathBuf::from("config.toml")];
+    let candidates: [PathBuf; 3] = [
+        PathBuf::from(CONFIG_PATH),
+        PathBuf::from(SYS_CONFIG_PATH),
+        PathBuf::from("config.toml"),
+    ];
     let mut last: Option<(PathBuf, String)> = None;
     for path in candidates {
         match bspwm_cyberquote::config::load_config(&path) {
             Ok(c) => {
+                if path == PathBuf::from(SYS_CONFIG_PATH) {
+                    seed_user_config(&path);
+                }
                 eprintln!("bspwm-cyberquote-native: config loaded from {}", path.display());
                 return Ok(c);
             }
@@ -56,6 +68,36 @@ fn load_cfg() -> Result<Config, (PathBuf, String)> {
     match last {
         Some((p, s)) => Err((p, s)),
         None => Err((PathBuf::from(CONFIG_PATH), "no config candidate loaded".into())),
+    }
+}
+
+/// First-run convenience: when the only config found is the packaged `/etc`
+/// default, copy it to `~/.config/bspwm-cyberquote/config.toml` so the user
+/// has an editable copy.  A best-effort — failure is non-fatal.
+fn seed_user_config(sys_path: &Path) {
+    let user_path = PathBuf::from(CONFIG_PATH);
+    if user_path.exists() {
+        return;
+    }
+    if let Some(dir) = user_path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    match std::fs::copy(sys_path, &user_path) {
+        Ok(_) => {
+            eprintln!(
+                "bspwm-cyberquote-native: seeded {} from the system default",
+                user_path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "bspwm-cyberquote-native: could not seed {}: {}",
+                user_path.display(),
+                e
+            );
+        }
     }
 }
 
@@ -104,15 +146,15 @@ fn build_windows(app: &Application) {
     let theme = render::Theme {
         bg: render::hex_color(&cfg.display.background_color),
         fg: render::hex_color(&cfg.display.foreground_color),
-        cyan: render::hex_color(&cfg.accent.cyan),
-        magenta: render::hex_color(&cfg.accent.magenta),
+        color_a: render::hex_color(&cfg.glitch.color_a),
+        color_b: render::hex_color(&cfg.glitch.color_b),
         orange: render::hex_color(&cfg.accent.orange),
         font_family: first_font_family(&cfg.display.font),
         font_px: cfg.display.font_size.max(8.0) as f64,
         scanline_alpha: cfg.accent.scanline_opacity.clamp(0.0, 1.0) as f64,
         scanline_lines: cfg.accent.scanline_lines,
         animated_scanlines: false, // flipped per-window once RGBA is probed
-        glitch_intensity: cfg.accent.glitch_intensity.clamp(0.0, 1.0) as f64,
+        glitch_intensity: cfg.glitch.glitch_intensity.clamp(0.0, 1.0) as f64,
         author_ink: render::hex_color(&cfg.accent.author_color),
         cursor_ink: render::hex_color(&cfg.accent.cursor_color),
         glow_color: render::hex_color(&cfg.glow.color),
@@ -180,7 +222,10 @@ fn build_windows(app: &Application) {
     };
 
     let cycle_minutes = cfg.quotes.cycle_interval_minutes;
-    let glitch_ms = (cfg.accent.glitch_duration.max(0.05) * 1000.0) as u64;
+    let glitch_ms = (cfg.glitch.glitch_duration.max(0.05) * 1000.0) as u64;
+    let interval_min_ms = (cfg.glitch.interval_min_seconds.max(0.0) * 1000.0) as u64;
+    let interval_max_ms =
+        (cfg.glitch.interval_max_seconds.max(cfg.glitch.interval_min_seconds) * 1000.0) as u64;
 
     for (idx, geometry) in geometries.iter().enumerate() {
         let mw = build_monitor_window(
@@ -195,6 +240,8 @@ fn build_windows(app: &Application) {
             &mw.glitch_ghost,
             &mw.glitch_echo_px,
             glitch_ms,
+            interval_min_ms,
+            interval_max_ms,
             theme.glitch_intensity,
         );
         // One-shot typewriter reveal for the first phrase each monitor sees.
@@ -419,8 +466,9 @@ fn monitor_index_at((x, y): (i32, i32)) -> Option<i32> {
     })
 }
 
-/// Arm a glitch burst `random(2s..12s)` from now.  On fire, run a multi-step
-/// burst (see `run_glitch_burst`), then re-arm with a fresh random delay.
+/// Arm a glitch burst within `min_ms..=max_ms` from now.  On fire, run a
+/// multi-step burst (see `run_glitch_burst`), then re-arm with a fresh random
+/// delay in the same configured window.
 fn arm_glitch_timer(
     area: &DrawingArea,
     glitch_on: &Rc<Cell<bool>>,
@@ -430,6 +478,8 @@ fn arm_glitch_timer(
     glitch_ghost: &Rc<Cell<bool>>,
     glitch_echo_px: &Rc<Cell<f64>>,
     glitch_ms: u64,
+    interval_min_ms: u64,
+    interval_max_ms: u64,
     intensity: f64,
 ) {
     let area = area.clone();
@@ -441,7 +491,7 @@ fn arm_glitch_timer(
     let glitch_echo_px = glitch_echo_px.clone();
 
     let mut rng = rand::thread_rng();
-    let delay_ms = rng.gen_range(2000..=12_000);
+    let delay_ms = rng.gen_range(interval_min_ms..=interval_max_ms);
     glib::timeout_add_local(std::time::Duration::from_millis(delay_ms), move || {
         run_glitch_burst(
             &area,
@@ -452,6 +502,8 @@ fn arm_glitch_timer(
             &glitch_ghost,
             &glitch_echo_px,
             glitch_ms,
+            interval_min_ms,
+            interval_max_ms,
             intensity,
         );
         glib::ControlFlow::Break
@@ -459,7 +511,7 @@ fn arm_glitch_timer(
 }
 
 /// One glitch burst, mirroring the HTML `glitch-full` keyframes: the whole
-/// text block swings left/right in wide steps with cyan/magenta chromatic
+/// text block swings left/right in wide steps with chromatic color_a/color_b
 /// echoes, occasional white invert flashes, and blank strobing frames.  The
 /// burst lasts ~`glitch_ms`; the last few steps ease back to the origin so
 /// the text settles instead of snapping.
@@ -474,6 +526,8 @@ fn run_glitch_burst(
     glitch_ghost: &Rc<Cell<bool>>,
     glitch_echo_px: &Rc<Cell<f64>>,
     glitch_ms: u64,
+    interval_min_ms: u64,
+    interval_max_ms: u64,
     intensity: f64,
 ) {
     let steps = (glitch_ms / GLITCH_STEP_MS).max(6);
@@ -510,6 +564,8 @@ fn run_glitch_burst(
                 &glitch_ghost,
                 &glitch_echo_px,
                 glitch_ms,
+                interval_min_ms,
+                interval_max_ms,
                 intensity,
             );
             return glib::ControlFlow::Break;

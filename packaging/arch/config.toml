@@ -1,7 +1,7 @@
-# bspwm-cyberquote — default configuration
-# Place at: ~/.config/bspwm-cyberquote/config.toml
-# (Agent 1 declares CONFIG_PATH = /etc/bspwm-cyberquote/config.toml for the
-#  system-wide path; override the path in main.rs if you prefer a per-user file.)
+# bspwm-cyberquote-native — packaged default configuration.
+# Installed by the Arch package to /etc/bspwm-cyberquote/config.toml.
+# On first run the app copies this to ~/.config/bspwm-cyberquote/config.toml;
+# edit the ~/.config copy to personalize (it takes precedence).
 
 [display]
 font = "JetBrains Mono, monospace"
@@ -37,8 +37,9 @@ intensity = 0.48
 thickness = 1.0
 
 [quotes]
-# Relative to the working directory, or an absolute path.
-source = "quotes.json"
+# Absolute path to the quote pool shipped with the package. Point this at your
+# own file to use a personal list.
+source = "/usr/share/bspwm-cyberquote-native/quotes.json"
 cycle_interval_minutes = 0
 picker = "random"
 

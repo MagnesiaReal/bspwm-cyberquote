@@ -25,18 +25,23 @@
 //!   │   foreground_color: "#00ffea"               # CSS hex color         │
 //!   │                                                                 │
 //!   │ accent:                                                         │
-//!   │   cyan: "#00ffff"                           # CSS hex color         │
-//!   │   magenta: "#ff00ff"                        # CSS hex color         │
 //!   │   author_color: "#ffa028e6"                 # author ink               │
 //!   │   cursor_color: "#ffa028e6"                 # terminal caret (fork)     │
-//!   │   glitch_intensity: 0.35                    # 0.0-1.0               │
-//!   │   glitch_duration: 0.52                     # per-glitch seconds     │
-//!   │   glitch_interval: 6.5                      # seconds between glitch │
+//!   │   orange: "#ffb347"                          # accent fallback           │
 //!   │   scanline_opacity: 0.15                    # 0.0-1.0               │
 //!   │   scanline_steps: 2160                       # ≈24 steps/s (fluid)  │
 //!   │   scanline_lines: 216                        # line+gap per screen   │
 //!   │   scanline_size_rem: 0.1                     # line thickness in rem │
 //!   │   crt_curvature: 0.12                       # screen bend factor    │
+//!   │                                                                 │
+//!   │ glitch:                                                         │
+//!   │   color_a: "#00ffff"                        # chromatic echo A (cyan) │
+//!   │   color_b: "#ff00ff"                        # chromatic echo B (magenta)│
+//!   │   glitch_intensity: 0.35                    # 0.0-1.0               │
+//!   │   glitch_duration: 0.52                     # per-glitch seconds     │
+//!   │   glitch_interval: 6.5                      # legacy CSS interval    │
+//!   │   interval_min_seconds: 2.0                 # random-trigger lower   │
+//!   │   interval_max_seconds: 12.0                # random-trigger upper   │
 //!   │                                                                 │
 //!   │ glow:                                                           │
 //!   │   enabled: true                            # master switch         │
@@ -78,9 +83,12 @@ pub struct Config {
     /// Display-level settings: font, size, opacity, colors.
     #[serde(default)]
     pub display: DisplayConfig,
-    /// Accent / effect settings: cyan, magenta, glitch, scanlines, CRT.
+    /// Accent / effect settings: colors, scanlines, CRT.
     #[serde(default)]
     pub accent: AccentConfig,
+    /// Glitch-effect settings: chromatic echo colors + trigger timing.
+    #[serde(default)]
+    pub glitch: GlitchConfig,
     /// Glow effect settings for the quote text.
     #[serde(default)]
     pub glow: GlowConfig,
@@ -98,6 +106,7 @@ impl Config {
         Self {
             display: DisplayConfig::defaults(),
             accent: AccentConfig::defaults(),
+            glitch: GlitchConfig::defaults(),
             glow: GlowConfig::defaults(),
             quotes: QuotesConfig::defaults(),
             monitors: MonitorsConfig::defaults(),
@@ -162,22 +171,12 @@ impl Default for DisplayConfig {
 /// Accent config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccentConfig {
-    #[serde(default = "AccentConfig::default_cyan")]
-    pub cyan: String,
-    #[serde(default = "AccentConfig::default_magenta")]
-    pub magenta: String,
     #[serde(default = "AccentConfig::default_orange")]
     pub orange: String,
     #[serde(default = "AccentConfig::default_author_color")]
     pub author_color: String,
     #[serde(default = "AccentConfig::default_cursor_color")]
     pub cursor_color: String,
-    #[serde(default = "AccentConfig::default_glitch_intensity")]
-    pub glitch_intensity: f32,
-    #[serde(default = "AccentConfig::default_glitch_duration")]
-    pub glitch_duration: f32,
-    #[serde(default = "AccentConfig::default_glitch_interval")]
-    pub glitch_interval: f32,
     #[serde(default = "AccentConfig::default_scanline_opacity")]
     pub scanline_opacity: f32,
     #[serde(default = "AccentConfig::default_scanline_steps")]
@@ -193,26 +192,15 @@ pub struct AccentConfig {
 impl AccentConfig {
     fn defaults() -> Self {
         Self {
-            cyan: Self::default_cyan(),
-            magenta: Self::default_magenta(),
             orange: Self::default_orange(),
             author_color: Self::default_author_color(),
             cursor_color: Self::default_cursor_color(),
-            glitch_intensity: Self::default_glitch_intensity(),
-            glitch_duration: Self::default_glitch_duration(),
-            glitch_interval: Self::default_glitch_interval(),
             scanline_opacity: Self::default_scanline_opacity(),
             scanline_steps: Self::default_scanline_steps(),
             scanline_lines: Self::default_scanline_lines(),
             scanline_size_rem: Self::default_scanline_size_rem(),
             crt_curvature: Self::default_crt_curvature(),
         }
-    }
-    fn default_cyan() -> String {
-        "#00ffff".into()
-    }
-    fn default_magenta() -> String {
-        "#ff00ff".into()
     }
     fn default_orange() -> String {
         "#ffe3b3".into()
@@ -222,15 +210,6 @@ impl AccentConfig {
     }
     fn default_cursor_color() -> String {
         "#ffa028e6".into()
-    }
-    fn default_glitch_intensity() -> f32 {
-        0.35
-    }
-    fn default_glitch_duration() -> f32 {
-        0.5
-    }
-    fn default_glitch_interval() -> f32 {
-        6.5
     }
     fn default_scanline_opacity() -> f32 {
         0.20
@@ -250,6 +229,74 @@ impl AccentConfig {
 }
 
 impl Default for AccentConfig {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+/// Glitch-effect config: chromatic-echo colors plus trigger timing.
+///
+/// The chromatic split mimics an RGB signal tear: `color_a` (the old
+/// `accent.cyan`) is echoed to the left of the block and `color_b` (the old
+/// `accent.magenta`) to the right.  `interval_min_seconds` /
+/// `interval_max_seconds` bound the random delay before the next glitch burst
+/// fires (the previous hardcoded 2–12 s window).  `glitch_intensity` and
+/// `glitch_duration` ride the same burst; `glitch_interval` is the legacy knob
+/// consumed only by the (webkit-fork) CSS stylesheet.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GlitchConfig {
+    #[serde(default = "GlitchConfig::default_color_a")]
+    pub color_a: String,
+    #[serde(default = "GlitchConfig::default_color_b")]
+    pub color_b: String,
+    #[serde(default = "GlitchConfig::default_glitch_intensity")]
+    pub glitch_intensity: f32,
+    #[serde(default = "GlitchConfig::default_glitch_duration")]
+    pub glitch_duration: f32,
+    #[serde(default = "GlitchConfig::default_glitch_interval")]
+    pub glitch_interval: f32,
+    #[serde(default = "GlitchConfig::default_interval_min_seconds")]
+    pub interval_min_seconds: f32,
+    #[serde(default = "GlitchConfig::default_interval_max_seconds")]
+    pub interval_max_seconds: f32,
+}
+
+impl GlitchConfig {
+    fn defaults() -> Self {
+        Self {
+            color_a: Self::default_color_a(),
+            color_b: Self::default_color_b(),
+            glitch_intensity: Self::default_glitch_intensity(),
+            glitch_duration: Self::default_glitch_duration(),
+            glitch_interval: Self::default_glitch_interval(),
+            interval_min_seconds: Self::default_interval_min_seconds(),
+            interval_max_seconds: Self::default_interval_max_seconds(),
+        }
+    }
+    fn default_color_a() -> String {
+        "#00ffff".into()
+    }
+    fn default_color_b() -> String {
+        "#ff00ff".into()
+    }
+    fn default_glitch_intensity() -> f32 {
+        0.35
+    }
+    fn default_glitch_duration() -> f32 {
+        0.5
+    }
+    fn default_glitch_interval() -> f32 {
+        6.5
+    }
+    fn default_interval_min_seconds() -> f32 {
+        2.0
+    }
+    fn default_interval_max_seconds() -> f32 {
+        12.0
+    }
+}
+
+impl Default for GlitchConfig {
     fn default() -> Self {
         Self::defaults()
     }
@@ -426,8 +473,8 @@ impl std::error::Error for ConfigError {}
 pub fn build_stylesheet(config: &Config) -> String {
     let bg = css_color(&config.display.background_color);
     let fg = css_color(&config.display.foreground_color);
-    let cyan = css_color(&config.accent.cyan);
-    let magenta = css_color(&config.accent.magenta);
+    let cyan = css_color(&config.glitch.color_a);
+    let magenta = css_color(&config.glitch.color_b);
     let orange = css_color(&config.accent.orange);
 
     let font_family = css_font_family(&config.display.font);
@@ -440,9 +487,9 @@ pub fn build_stylesheet(config: &Config) -> String {
     let center_padding = "36px";
     let max_quote_chars = "900";
 
-    let glitch_intensity = css_len_px(config.accent.glitch_intensity * 6.0 / 0.35);
-    let glitch_duration = css_animation_duration(config.accent.glitch_duration);
-    let glitch_ms = format!("{}ms", (config.accent.glitch_interval * 1000.0) as u32);
+    let glitch_intensity = css_len_px(config.glitch.glitch_intensity * 6.0 / 0.35);
+    let glitch_duration = css_animation_duration(config.glitch.glitch_duration);
+    let glitch_ms = format!("{}ms", (config.glitch.glitch_interval * 1000.0) as u32);
     let glitch_jitter = "1.2px";
 
     let scanline_opacity = css_alpha(config.accent.scanline_opacity);
@@ -713,19 +760,23 @@ background_color = "#050508"
 foreground_color = "#ff5cf0"
 
 [accent]
-cyan = "#00ffcc"
-magenta = "#ff0088"
 orange = "#ffb347"
 author_color = "#ffa028e6"
 cursor_color = "#ffa028e6"
-glitch_intensity = 0.45
-glitch_duration = 0.30
-glitch_interval = 4.0
 scanline_opacity = 0.20
 scanline_steps = 120
 scanline_lines = 360
 scanline_size_rem = 0.07
 crt_curvature = 0.18
+
+[glitch]
+color_a = "#00ffcc"
+color_b = "#ff0088"
+glitch_intensity = 0.45
+glitch_duration = 0.30
+glitch_interval = 4.0
+interval_min_seconds = 3.0
+interval_max_seconds = 15.0
 
 [glow]
 enabled = true
@@ -757,14 +808,16 @@ primary_only = true
         assert_eq!(c.display.background_color, "#050508");
         assert_eq!(c.display.foreground_color, "#ff5cf0");
 
-        assert_eq!(c.accent.cyan, "#00ffcc");
-        assert_eq!(c.accent.magenta, "#ff0088");
+        assert_eq!(c.glitch.color_a, "#00ffcc");
+        assert_eq!(c.glitch.color_b, "#ff0088");
+        assert!((c.glitch.glitch_intensity - 0.45).abs() < 0.01);
+        assert!((c.glitch.glitch_duration - 0.30).abs() < 0.01);
+        assert!((c.glitch.glitch_interval - 4.0).abs() < 0.01);
+        assert!((c.glitch.interval_min_seconds - 3.0).abs() < 0.01);
+        assert!((c.glitch.interval_max_seconds - 15.0).abs() < 0.01);
         assert_eq!(c.accent.orange, "#ffb347");
         assert_eq!(c.accent.author_color, "#ffa028e6");
         assert_eq!(c.accent.cursor_color, "#ffa028e6");
-        assert!((c.accent.glitch_intensity - 0.45).abs() < 0.01);
-        assert!((c.accent.glitch_duration - 0.30).abs() < 0.01);
-        assert!((c.accent.glitch_interval - 4.0).abs() < 0.01);
         assert!((c.accent.scanline_opacity - 0.20).abs() < 0.01);
         assert_eq!(c.accent.scanline_steps, 120);
         assert_eq!(c.accent.scanline_lines, 360);
@@ -794,13 +847,15 @@ primary_only = true
         assert!((c.display.opacity - DisplayConfig::default_opacity()).abs() < 0.01);
         assert_eq!(c.display.background_color, DisplayConfig::default_background_color());
         assert_eq!(c.display.foreground_color, DisplayConfig::default_foreground_color());
-        assert_eq!(c.accent.cyan, AccentConfig::default_cyan());
-        assert_eq!(c.accent.magenta, AccentConfig::default_magenta());
+        assert_eq!(c.glitch.color_a, GlitchConfig::default_color_a());
+        assert_eq!(c.glitch.color_b, GlitchConfig::default_color_b());
+        assert!((c.glitch.glitch_intensity - GlitchConfig::default_glitch_intensity()).abs() < 0.01);
+        assert!((c.glitch.glitch_duration - GlitchConfig::default_glitch_duration()).abs() < 0.01);
+        assert!((c.glitch.glitch_interval - GlitchConfig::default_glitch_interval()).abs() < 0.01);
+        assert!((c.glitch.interval_min_seconds - GlitchConfig::default_interval_min_seconds()).abs() < 0.01);
+        assert!((c.glitch.interval_max_seconds - GlitchConfig::default_interval_max_seconds()).abs() < 0.01);
         assert_eq!(c.accent.author_color, AccentConfig::default_author_color());
         assert_eq!(c.accent.cursor_color, AccentConfig::default_cursor_color());
-        assert!((c.accent.glitch_intensity - AccentConfig::default_glitch_intensity()).abs() < 0.01);
-        assert!((c.accent.glitch_duration - AccentConfig::default_glitch_duration()).abs() < 0.01);
-        assert!((c.accent.glitch_interval - AccentConfig::default_glitch_interval()).abs() < 0.01);
         assert!((c.accent.scanline_opacity - AccentConfig::default_scanline_opacity()).abs() < 0.01);
         assert_eq!(c.accent.scanline_steps, AccentConfig::default_scanline_steps());
         assert_eq!(c.accent.scanline_lines, AccentConfig::default_scanline_lines());
