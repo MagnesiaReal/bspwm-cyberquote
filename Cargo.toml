@@ -1,8 +1,8 @@
 [package]
-name = "bspwm-cyberquote-native"
+name = "bspwm-cyberquote"
 version = "0.1.0"
 edition = "2021"
-description = "Native (Cairo/Pango) fork of bspwm-cyberquote — desktop quote ticker with no WebView."
+description = "Cairo/Pango desktop quote ticker for bspwm — cyberpunk overlay, no WebView."
 
 [lib]
 name = "bspwm_cyberquote"

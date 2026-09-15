@@ -1,4 +1,4 @@
-# bspwm-cyberquote-native — packaged default configuration.
+# bspwm-cyberquote — packaged default configuration.
 # Installed by the Arch package to /etc/bspwm-cyberquote/config.toml.
 # On first run the app copies this to ~/.config/bspwm-cyberquote/config.toml;
 # edit the ~/.config copy to personalize (it takes precedence).
@@ -43,7 +43,7 @@ thickness = 1.0
 [quotes]
 # Absolute path to the quote pool shipped with the package. Point this at your
 # own file to use a personal list.
-source = "/usr/share/bspwm-cyberquote-native/quotes.json"
+source = "/usr/share/bspwm-cyberquote/quotes.json"
 cycle_interval_minutes = 0
 picker = "random"
 

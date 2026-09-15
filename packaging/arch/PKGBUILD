@@ -1,13 +1,13 @@
-# bspwm-cyberquote-native — native (Cairo/Pango) desktop quote ticker for bspwm.
+# bspwm-cyberquote — Cairo/Pango desktop quote ticker for bspwm.
 # Build in-place: run `makepkg -si` from this repository root.
 # Maintainer: MagnesiaReal <github@MagnesiaReal>
 
-pkgname=bspwm-cyberquote-native
+pkgname=bspwm-cyberquote
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Native (Cairo/Pango) fork of bspwm-cyberquote — desktop quote ticker with no WebView"
+pkgdesc="Cairo/Pango desktop quote ticker for bspwm — cyberpunk overlay, no WebView"
 arch=('x86_64')
-url="https://github.com/MagnesiaReal/bspwm-cyberquote-native"
+url="https://github.com/MagnesiaReal/bspwm-cyberquote"
 license=('MIT')
 depends=('gtk3' 'glib2' 'pango' 'cairo')
 makedepends=('rust' 'pkgconf')
@@ -27,17 +27,17 @@ check() {
 
 package() {
     # Binary.
-    install -Dm755 "$startdir/target/release/bspwm-cyberquote-native" \
-        "$pkgdir/usr/bin/bspwm-cyberquote-native"
+    install -Dm755 "$startdir/target/release/bspwm-cyberquote" \
+        "$pkgdir/usr/bin/bspwm-cyberquote"
     # System-wide default config (auto-copied to ~/.config on first run).
     install -Dm644 "$startdir/packaging/arch/config.toml" \
         "$pkgdir/etc/bspwm-cyberquote/config.toml"
     # Quote pool.
     install -Dm644 "$startdir/quotes.json" \
-        "$pkgdir/usr/share/bspwm-cyberquote-native/quotes.json"
+        "$pkgdir/usr/share/bspwm-cyberquote/quotes.json"
     # Docs + license.
     install -Dm644 "$startdir/README.md" \
-        "$pkgdir/usr/share/doc/bspwm-cyberquote-native/README.md"
+        "$pkgdir/usr/share/doc/bspwm-cyberquote/README.md"
     install -Dm644 "$startdir/LICENSE" \
         "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

@@ -1,9 +1,9 @@
-# bspwm-cyberquote-native
+# bspwm-cyberquote
 
-Native (Cairo/Pango) fork of [bspwm-cyberquote](https://github.com/MagnesiaReal/bspwm_cyberquote) —
-a cyberpunk motivational quote overlay for BSPWM. One undecorated, desktop-hint
-window per monitor paints the quote ticker (scanlines, vignette, RGB-split
-glitch, typewriter reveal, terminal caret) directly with Cairo — no WebView.
+A cyberpunk motivational quote overlay for BSPWM, painted natively with
+Cairo/Pango — no WebView. One undecorated, desktop-hint window per monitor
+drives the quote ticker (scanlines, vignette, RGB-split glitch, typewriter
+reveal, terminal caret):
 
 ## Install (Arch Linux)
 
@@ -15,9 +15,9 @@ This installs:
 
 | Path | Purpose |
 |---|---|
-| `/usr/bin/bspwm-cyberquote-native` | the binary |
+| `/usr/bin/bspwm-cyberquote` | the binary |
 | `/etc/bspwm-cyberquote/config.toml` | system-wide default config |
-| `/usr/share/bspwm-cyberquote-native/quotes.json` | default quote pool |
+| `/usr/share/bspwm-cyberquote/quotes.json` | default quote pool |
 | `/usr/lib/... ` | _(nothing — no systemd unit, launch via bspwmrc)_ |
 
 ### Config
@@ -39,22 +39,22 @@ personal quote list.
 Launch it at session start from `~/.config/bspwm/bspwmrc`:
 
 ```sh
-pgrep -f bspwm-cyberquote-native >/dev/null || bspwm-cyberquote-native &
+pgrep -f bspwm-cyberquote >/dev/null || bspwm-cyberquote &
 ```
 
-(`pgrep -f` matches the full command line — `/proc/<pid>/comm` is truncated to
-15 chars, so a plain `pgrep -x` won't find it.)
+(`pgrep -f` matches the full command line, so it is safe even if the binary
+is still running under its old name.)
 
 If you'd rather use systemd, enable crash-restart + logs instead:
 
 ```sh
 systemctl --user edit --full --force --runtime bspwm-cyberquote.service <<'EOF'
 [Unit]
-Description=bspwm-cyberquote-native desktop quote ticker
+Description=bspwm-cyberquote desktop quote ticker
 [Service]
 Type=simple
 Environment=DISPLAY=:0
-ExecStart=/usr/bin/bspwm-cyberquote-native
+ExecStart=/usr/bin/bspwm-cyberquote
 Restart=always
 RestartSec=2
 [Install]

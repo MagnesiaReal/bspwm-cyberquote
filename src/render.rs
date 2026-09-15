@@ -1,4 +1,4 @@
-//! Cairo/Pango paint pipeline for the native fork.
+//! Cairo/Pango paint pipeline for the quote ticker.
 //!
 //! Cost model: a full frame only redraws on a quote change, during the one-shot
 //! typewriter reveal (~30 ms/char until the phrase is fully shown), during a

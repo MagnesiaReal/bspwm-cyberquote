@@ -1,4 +1,4 @@
-//! bspwm-cyberquote-native — GTK3 + Cairo/Pango host (no WebView).
+//! bspwm-cyberquote — GTK3 + Cairo/Pango host (no WebView).
 //!
 //! Spawns one undecorated GTK3 window per monitor.  Each window is stamped with
 //! `WindowTypeHint::Desktop` (the GTK3 native way — GTK itself sets
@@ -14,8 +14,9 @@
 //! (`arm_cursor_blink`, ~1.9 Hz) — the heavy layer is never repainted for
 //! either.
 //!
-//! `config`/`quotes` are shared verbatim with the original repo, so this binary
-//! reads the same `~/.config/bspwm-cyberquote/config.toml` and quote pool.
+//! `config`/`quotes` are the shared modules behind the whole quote ticker, so
+//! this binary reads `~/.config/bspwm-cyberquote/config.toml` and the quote
+//! pool documented in the README.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -36,7 +37,7 @@ use bspwm_cyberquote::render;
 type TileCache = Rc<RefCell<Option<(usize, usize, gtk::cairo::ImageSurface)>>>;
 
 // ---------------------------------------------------------------------------
-// Config path — matches the original and the fork's shared config module.
+// Config path — shared config module.
 // ---------------------------------------------------------------------------
 const CONFIG_PATH: &str = concat!(env!("HOME"), "/.config/bspwm-cyberquote/config.toml");
 
@@ -59,7 +60,7 @@ fn load_cfg() -> Result<Config, (PathBuf, String)> {
                 if path == PathBuf::from(SYS_CONFIG_PATH) {
                     seed_user_config(&path);
                 }
-                eprintln!("bspwm-cyberquote-native: config loaded from {}", path.display());
+                eprintln!("bspwm-cyberquote: config loaded from {}", path.display());
                 return Ok(c);
             }
             Err(e) => last = Some((path, e.to_string())),
@@ -87,13 +88,13 @@ fn seed_user_config(sys_path: &Path) {
     match std::fs::copy(sys_path, &user_path) {
         Ok(_) => {
             eprintln!(
-                "bspwm-cyberquote-native: seeded {} from the system default",
+                "bspwm-cyberquote: seeded {} from the system default",
                 user_path.display()
             );
         }
         Err(e) => {
             eprintln!(
-                "bspwm-cyberquote-native: could not seed {}: {}",
+                "bspwm-cyberquote: could not seed {}: {}",
                 user_path.display(),
                 e
             );
@@ -126,7 +127,7 @@ struct MonitorWindow {
 
 fn main() {
     let app = Application::builder()
-        .application_id("com.bspwm.cyberquote-native")
+        .application_id("com.bspwm.cyberquote")
         .build();
 
     app.connect_activate(build_windows);
@@ -138,7 +139,7 @@ fn build_windows(app: &Application) {
     let cfg = match load_cfg() {
         Ok(c) => c,
         Err((_, e)) => {
-            eprintln!("bspwm-cyberquote-native: config load failed ({}), using defaults", e);
+            eprintln!("bspwm-cyberquote: config load failed ({}), using defaults", e);
             Config::defaults()
         }
     };
@@ -199,7 +200,7 @@ fn build_windows(app: &Application) {
 
     let geometries: Vec<WindowGeometry> = bspwm_cyberquote::config::monitor_layout(&monitor_infos);
     eprintln!(
-        "bspwm-cyberquote-native: {} monitor(s) -> {} window(s)",
+        "bspwm-cyberquote: {} monitor(s) -> {} window(s)",
         monitors.len(),
         geometries.len()
     );
@@ -209,12 +210,12 @@ fn build_windows(app: &Application) {
     let selections = match load_and_pick_many(Some(quote_path), geometries.len()) {
         Ok(sel) => sel,
         Err(e) => {
-            eprintln!("bspwm-cyberquote-native: quote load failed ({}), using fallback", e);
+            eprintln!("bspwm-cyberquote: quote load failed ({}), using fallback", e);
             vec![
                 bspwm_cyberquote::quotes::QuoteSelection {
                     quote: Quote {
                         text: "System online — awaiting quote feed.".into(),
-                        author: "bspwm-cyberquote-native".into(),
+                        author: "bspwm-cyberquote".into(),
                     },
                 };
                 geometries.len()
@@ -265,7 +266,7 @@ fn build_windows(app: &Application) {
         mw.window.show_all();
         let dbg = mw.window.window().map(|w| format!("gdk_vis={}", w.is_visible()));
         eprintln!(
-            "bspwm-cyberquote-native: window {} {}x{} is_visible={} gdk={:?}",
+            "bspwm-cyberquote: window {} {}x{} is_visible={} gdk={:?}",
             idx,
             geometry.width,
             geometry.height,
