@@ -17,6 +17,11 @@
 //! `config`/`quotes` are the shared modules behind the whole quote ticker, so
 //! this binary reads `~/.config/bspwm-cyberquote/config.toml` and the quote
 //! pool documented in the README.
+//!
+//! The binary is single-instance with reset semantics: launching it again while
+//! one copy is running makes the new process terminate the old one and take
+//! over (fresh config, fresh quotes, fresh reveal) instead of stacking a
+//! second copy.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -35,6 +40,98 @@ use bspwm_cyberquote::render;
 /// Lazily-built scanline tile for the animated overlay: keyed by (w, h), so
 /// it's rebuilt only on resize and reused for the whole 20 fps sweep.
 type TileCache = Rc<RefCell<Option<(usize, usize, gtk::cairo::ImageSurface)>>>;
+
+// ---------------------------------------------------------------------------
+// Single-instance control — a second launch resets (kills + relaunches) the
+// running instance instead of stacking another copy.
+// ---------------------------------------------------------------------------
+
+/// Display identifier used to keep lock files per-session.
+fn display_key() -> String {
+    ["DISPLAY", "WAYLAND_DISPLAY"]
+        .iter()
+        .find_map(|v| {
+            std::env::var(v)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.replace(['/', ':'], "_"))
+        })
+        .unwrap_or_else(|| "default".into())
+}
+
+fn lock_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::temp_dir()));
+    dir.join(format!("bspwm-cyberquote-{}.pid", display_key()))
+}
+
+/// Match the binary name inside a raw `/proc/<pid>/cmdline` blob (NUL-separated).
+fn cmdline_is_our_binary(raw: &[u8]) -> bool {
+    const NAME: &[u8] = b"bspwm-cyberquote";
+    raw.split(|&b| b == 0)
+        .filter(|arg| !arg.is_empty())
+        .any(|arg| arg.rsplit(|&b| b == b'/').next() == Some(NAME))
+}
+
+/// True only if `pid` belongs to a live bspwm-cyberquote process (checks both
+/// liveness and command-line, so a reused PID can never make us kill innocent
+/// children).
+fn pid_is_this_instance(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|c| cmdline_is_our_binary(&c))
+        .unwrap_or(false)
+}
+
+/// Claim the single-instance lock: if a running copy exists, terminate it and
+/// wait for it to die before allowing our caller to proceed.
+fn claim_single_instance() {
+    let path = lock_path();
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        if let Ok(pid) = contents.trim().parse::<i32>() {
+            if pid != std::process::id() as i32 && pid_is_this_instance(pid) {
+                eprintln!(
+                    "bspwm-cyberquote: resetting running instance (pid {pid})"
+                );
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while pid_is_this_instance(pid) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if pid_is_this_instance(pid) {
+                    eprintln!("bspwm-cyberquote: SIGTERM ignored — sending SIGKILL");
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+    match std::fs::write(&path, format!("{}\n", std::process::id())) {
+        Ok(()) => {}
+        Err(e) => eprintln!(
+            "bspwm-cyberquote: could not write instance lock {}: {}",
+            path.display(),
+            e
+        ),
+    }
+}
+
+/// Remove the lock file on clean exit (only if it still names us).
+fn release_instance_lock() {
+    let path = lock_path();
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        if contents.trim() == std::process::id().to_string() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config path — shared config module.
@@ -126,6 +223,10 @@ struct MonitorWindow {
 }
 
 fn main() {
+    // Before the GApplication registers (which would route us to the running
+    // instance over D-Bus), reset any live copy so this process takes over.
+    claim_single_instance();
+
     let app = Application::builder()
         .application_id("com.bspwm.cyberquote")
         .build();
@@ -133,6 +234,8 @@ fn main() {
     app.connect_activate(build_windows);
 
     let _ = app.run();
+
+    release_instance_lock();
 }
 
 fn build_windows(app: &Application) {
@@ -159,6 +262,11 @@ fn build_windows(app: &Application) {
         text_alignment: render::text_alignment(&cfg.display.text_alignment),
         scanline_alpha: cfg.accent.scanline_opacity.clamp(0.0, 1.0) as f64,
         scanline_lines: cfg.accent.scanline_lines,
+        // The `scanline_size_rem` knob finally becomes a real pixel thickness:
+        // 1 rem == the base font size (the same conversion the CSS path uses),
+        // so the mesh follows the knob instead of a fixed 35% of the pitch.
+        scanline_size_px: (cfg.accent.scanline_size_rem as f64 * cfg.display.font_size as f64)
+            .clamp(1.0, 8.0),
         animated_scanlines: false, // flipped per-window once RGBA is probed
         glitch_intensity: cfg.glitch.glitch_intensity.clamp(0.0, 1.0) as f64,
         author_ink: render::hex_color(&cfg.accent.author_color),
@@ -348,7 +456,7 @@ fn build_monitor_window(
     // Main layer draws its own static scanlines only when there is no RGBA
     // compositor to host the animated overlay (avoids double-darkening).
     let main_theme = render::Theme {
-        animated_scanlines: !animated,
+        animated_scanlines: animated,
         ..theme.clone()
     };
 
@@ -746,4 +854,37 @@ fn first_font_family(spec: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("monospace")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cmdline_is_our_binary;
+    use super::display_key;
+
+    #[test]
+    fn cmdline_matcher_accepts_our_binary() {
+        assert!(cmdline_is_our_binary(b"/usr/bin/bspwm-cyberquote\0--flag\0"));
+        assert!(cmdline_is_our_binary(b"bspwm-cyberquote\0"));
+    }
+
+    #[test]
+    fn cmdline_matcher_rejects_unrelated_processes() {
+        assert!(!cmdline_is_our_binary(b"/usr/bin/wal\0"));
+        assert!(!cmdline_is_our_binary(b"bspwm-cyberquoter\0tail\0"));
+        assert!(!cmdline_is_our_binary(b""));
+    }
+
+    #[test]
+    fn cmdline_matcher_accepts_repo_target_path() {
+        assert!(cmdline_is_our_binary(
+            b"/home/u/Desktop/bspwm-cyberquote/target/release/bspwm-cyberquote\0"
+        ));
+    }
+
+    #[test]
+    fn display_key_is_never_empty() {
+        std::env::remove_var("DISPLAY");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        assert!(!display_key().is_empty());
+    }
 }

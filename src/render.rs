@@ -53,6 +53,11 @@ pub struct Theme {
     pub scanline_alpha: f64,
     /// Scanline density: lines per screen height.
     pub scanline_lines: u32,
+    /// Physical scanline thickness in px.  Driven by the `scanline_size_rem`
+    /// knob so changing the config actually changes the mesh (before this the
+    /// value only reached the CSS variables and the cairo mesh kept a fixed
+    /// 35% thickness).
+    pub scanline_size_px: f64,
     /// False when the animated scanline overlay is active (draw() then skips
     /// its own static scanlines to avoid a double-darkened mesh).
     pub animated_scanlines: bool,
@@ -938,7 +943,9 @@ pub fn scanline_tile(theme: &Theme, w: i32, h: i32) -> Option<cairo::ImageSurfac
     }
     let spacing = (h as f64 / theme.scanline_lines as f64).max(2.0);
     let period = spacing.ceil();
-    let thickness = ((spacing * 0.35).clamp(1.0, 3.0) - 1.0).max(1.0);
+    // The config `scanline_size_rem` knob controls the band thickness; kept
+    // inside the pitch so it never overlaps the following gap.
+    let thickness = theme.scanline_size_px.clamp(1.0, spacing * 0.9).max(1.0);
 
     let surf = cairo::ImageSurface::create(cairo::Format::A8, w, period as i32).ok()?;
     let tc = cairo::Context::new(&surf).ok()?;
@@ -975,8 +982,9 @@ fn draw_scanlines(cr: &cairo::Context, w: f64, h: f64, theme: &Theme, phase: f64
         return;
     }
     let spacing = (h / theme.scanline_lines as f64).max(2.0);
-    // 1 px thinner than the natural 35% of the pitch, never below a hairline.
-    let thickness = ((spacing * 0.35).clamp(1.0, 3.0) - 1.0).max(1.0);
+    // Same knob as the animated tile: the config's `scanline_size_rem` knob
+    // finally reaches the static fallback too, so both meshes stay identical.
+    let thickness = theme.scanline_size_px.clamp(1.0, spacing * 0.9).max(1.0);
 
     // First band sits just above the top edge and scrolls into view; the
     // modulo keeps the wrap at exactly one period (no seam at the edge).
@@ -1028,6 +1036,7 @@ mod tests {
             text_alignment: pango::Alignment::Center,
             scanline_alpha: 0.3,
             scanline_lines: 100,
+            scanline_size_px: 1.5,
             animated_scanlines: false,
             glitch_intensity: 0.35,
             author_ink: (0.63, 0.16, 0.90),

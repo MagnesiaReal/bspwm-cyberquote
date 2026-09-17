@@ -1,15 +1,17 @@
-# bspwm-cyberquote — packaged default configuration.
-# Installed by the Arch package to /etc/bspwm-cyberquote/config.toml.
-# On first run the app copies this to ~/.config/bspwm-cyberquote/config.toml;
-# edit the ~/.config copy to personalize (it takes precedence).
+# bspwm-cyberquote — default configuration
+# Place at: ~/.config/bspwm-cyberquote/config.toml
+# (Agent 1 declares CONFIG_PATH = /etc/bspwm-cyberquote/config.toml for the
+#  system-wide path; override the path in main.rs if you prefer a per-user file.)
 
 [display]
 font = "JetBrains Mono, monospace"
 font_size = 37
 # Optional: author (attribution) font size in px.  Omit to match font_size.
-# author_font_size = 24
-# Text justification within the centered block: "left" | "center" (default) | "right"
-# text_alignment = "center"
+author_font_size = 24
+# Text justification of the quote lines AND author inside the centered block:
+# "left" | "center" (default) | "right"
+# In left/right mode the author anchors to the quote's block edge.
+text_alignment = "left"
 opacity = 0.96
 background_color = "#05070d"
 foreground_color = "#ffffff"
@@ -20,8 +22,8 @@ author_color = "#F4E394"
 cursor_color = "#F4E394"
 scanline_opacity = 0.20
 scanline_steps = 2160
-scanline_lines = 216
-scanline_size_rem = 0.2
+scanline_lines = 208
+scanline_size_rem = 0.5
 crt_curvature = 0.15
 
 [glitch]
@@ -36,14 +38,13 @@ interval_max_seconds = 10.0
 [glow]
 enabled = true
 color = "#FFFFFF"
-radius = 15.0
-intensity = 0.48
+radius = 16.0
+intensity = 0.49
 thickness = 1.0
 
 [quotes]
-# Absolute path to the quote pool shipped with the package. Point this at your
-# own file to use a personal list.
-source = "/usr/share/bspwm-cyberquote/quotes.json"
+# Relative to the working directory, or an absolute path.
+source = "quotes.json"
 cycle_interval_minutes = 0
 picker = "random"
 

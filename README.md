@@ -8,7 +8,7 @@ reveal, terminal caret):
 ## Install (Arch Linux)
 
 ```sh
-makepkg -si           # run from the repository root (packaging/arch/PKGBUILD)
+makepkg -si           # run from the repository root or from packaging/arch/
 ```
 
 This installs:
@@ -39,11 +39,12 @@ personal quote list.
 Launch it at session start from `~/.config/bspwm/bspwmrc`:
 
 ```sh
-pgrep -f bspwm-cyberquote >/dev/null || bspwm-cyberquote &
+bspwm-cyberquote &
 ```
 
-(`pgrep -f` matches the full command line, so it is safe even if the binary
-is still running under its old name.)
+The binary is single-instance: running it again (say, bound to a key) is
+harmless — the second invocation terminates the live copy and takes over with
+fresh config, quotes, and typewriter reveal. No `pgrep` guard needed.
 
 If you'd rather use systemd, enable crash-restart + logs instead:
 
