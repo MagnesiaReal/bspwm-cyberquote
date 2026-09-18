@@ -23,6 +23,7 @@
 
 use gtk::cairo;
 use gtk::pango;
+use rand::Rng;
 
 use crate::quotes::Quote;
 
@@ -76,6 +77,30 @@ pub struct Theme {
     pub glow_radius: f64,
     /// Stroke/outline thickness in px added to the underlay text before blur.
     pub glow_thickness: f64,
+    /// Squares: master switch.
+    pub squares_enabled: bool,
+    /// Squares: base color RGB (also tints the birth gradient).
+    pub squares_color: (f64, f64, f64),
+    /// Squares: peak alpha 0..1.
+    pub squares_opacity: f64,
+    /// Squares: drift speed in px/sec upward.
+    pub squares_speed: f64,
+    /// Squares: hard cap on concurrently-live particles.
+    pub squares_max: u32,
+    /// Squares: chance per 50 ms tick of spawning (0..1).
+    pub squares_spawn_rate: f64,
+    /// Squares: lower bound for random glitch-interval (sec).
+    pub squares_glitch_min_s: f64,
+    /// Squares: upper bound for random glitch-interval (sec).
+    pub squares_glitch_max_s: f64,
+    /// Squares: burst length in overlay ticks (~50 ms each).
+    pub squares_glitch_ticks: u32,
+    /// Bottom "birth" gradient switch.
+    pub birth_gradient: bool,
+    /// Birth gradient height as a fraction of screen height (0..1).
+    pub birth_gradient_height: f64,
+    /// Birth gradient opacity (0..1).
+    pub birth_gradient_intensity: f64,
 }
 
 /// Cache for the pre-rendered static glow halo of the quote body.
@@ -235,6 +260,14 @@ pub fn draw(
     // 1. background
     cr.set_source_rgba(br, bg, bb, 1.0);
     cr.paint();
+
+    // 1b. bottom "birth" glow where the squares emerge (static, cheap)
+    if theme.birth_gradient
+        && theme.birth_gradient_intensity > 0.0
+        && theme.birth_gradient_height > 0.0
+    {
+        draw_birth_gradient(cr, fw, fh, theme);
+    }
 
     // 2. text block (quote + author), centered slightly above middle
     let (tx, ty) = draw_text_block(cr, fw, fh, state, theme);
@@ -1014,6 +1047,262 @@ fn draw_vignette(cr: &cairo::Context, w: f64, h: f64) {
     cr.paint();
 }
 
+/// Soft bottom band (background layer): a solid-to-transparent linear gradient
+/// in the squares' color marking the "birth zone" the squares rise out of.
+/// Static, so on the never-animated main layer it costs one tiny gradient fill
+/// per (rare) main-layer repaint.
+fn draw_birth_gradient(cr: &cairo::Context, w: f64, h: f64, theme: &Theme) {
+    let band = (h * theme.birth_gradient_height.clamp(0.0, 1.0)).clamp(0.0, h);
+    if band <= 0.0 {
+        return;
+    }
+    let (r, g, b) = theme.squares_color;
+    let grad = cairo::LinearGradient::new(0.0, h - band, 0.0, h);
+    grad.add_color_stop_rgba(0.0, r, g, b, 0.0);
+    grad.add_color_stop_rgba(1.0, r, g, b, theme.birth_gradient_intensity.clamp(0.0, 1.0));
+    cr.set_source(&grad);
+    cr.rectangle(0.0, h - band, w, band);
+    let _ = cr.fill();
+}
+
+// ---------------------------------------------------------------------------
+// Floating glitched squares
+// ---------------------------------------------------------------------------
+
+/// Smallest square side (px).
+const SQUARE_MIN_PX: f64 = 5.0;
+/// Largest square side as a fraction of the body font size.
+const SQUARE_MAX_SCALE: f64 = 0.8;
+/// The "reference" size, as a fraction of the font, that drifts exactly at the
+/// configured `speed`; larger squares are proportionally faster (closer),
+/// smaller ones slower (far away) — the size-parallax illusion.
+const SQUARE_MED_REF_SCALE: f64 = 0.5;
+/// Speed-ratio floor/ceiling (relative to the reference size) so the very
+/// smallest/largest squares stay within a lively, not glacial/teleporting
+/// range.
+const SQUARE_MIN_SPEED_RATIO: f64 = 0.3;
+const SQUARE_MAX_SPEED_RATIO: f64 = 1.6;
+
+/// Lifetime alpha for a particle at normalized progress `t` (0..1): fade in
+/// as it emerges from the birth zone, hold, then fade back out just before it
+/// reaches the mid-screen target.
+fn square_alpha(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.18 {
+        t / 0.18
+    } else if t > 0.70 {
+        1.0 - (t - 0.70) / 0.30
+    } else {
+        1.0
+    }
+}
+
+/// Size → speed ratio: proportional to the square's side vs the reference
+/// size, clamped to the lively envelope.  Monotonic, so bigger always means
+/// faster.
+fn square_speed_ratio(size: f64, ref_size: f64) -> f64 {
+    (size / ref_size.max(1.0)).clamp(SQUARE_MIN_SPEED_RATIO, SQUARE_MAX_SPEED_RATIO)
+}
+
+/// One floating square.
+#[derive(Clone, Copy)]
+pub struct Particle {
+    /// Square side in px (random per particle).
+    pub size: f64,
+    pub x: f64,
+    pub y: f64,
+    pub start_y: f64,
+    pub end_y: f64,
+    /// Vertical drift in px/sec toward the top (proportional to `size`).
+    pub speed: f64,
+    /// Peak alpha for this particle (per-particle variety).
+    pub max_alpha: f64,
+    /// 0..1 progress from `start_y` to `end_y`.
+    pub t: f64,
+    /// Ticks until the next glitch burst may start.
+    pub next_glitch: u32,
+    /// Ticks remaining in the current glitch burst (0 = idle).
+    pub glitch_ticks: u32,
+    pub glitch_dx: f64,
+    pub glitch_dy: f64,
+    /// Re-rolled every glitch step, mirroring the text: the crisp white square
+    /// swings sideways and sways slightly up/down...
+    pub echo_a_dx: f64,
+    pub echo_a_dy: f64,
+    pub echo_b_dx: f64,
+    pub echo_b_dy: f64,
+}
+
+/// Reset a particle's per-tick glitch offsets (when a burst ends).
+fn reset_glitch(p: &mut Particle) {
+    p.glitch_dx = 0.0;
+    p.glitch_dy = 0.0;
+    p.echo_a_dx = 0.0;
+    p.echo_a_dy = 0.0;
+    p.echo_b_dx = 0.0;
+    p.echo_b_dy = 0.0;
+}
+
+/// Roll a fresh set of random offsets for one glitch step, mimicking the text
+/// glitch: the white square jumps to a random side amplitude and sways a bit
+/// vertically, while the color_a / color_b echoes appear at random individual
+/// offsets — randomly "desfasadas" from the white square.  Echoes are usually
+/// present but occasionally dropped for a cleaner step.
+fn shake_square(p: &mut Particle, rng: &mut impl rand::Rng) {
+    let amp = rng.gen_range(2.0..=10.0);
+    p.glitch_dx = if rng.gen_bool(0.5) { amp } else { -amp };
+    p.glitch_dy = rng.gen_range(-3.0..=3.0);
+    if rng.gen_bool(0.85) {
+        p.echo_a_dx = -rng.gen_range(3.0..=9.0);
+        p.echo_a_dy = rng.gen_range(-3.0..=3.0);
+        p.echo_b_dx = rng.gen_range(3.0..=9.0);
+        p.echo_b_dy = rng.gen_range(-3.0..=3.0);
+    } else {
+        p.echo_a_dx = 0.0;
+        p.echo_a_dy = 0.0;
+        p.echo_b_dx = 0.0;
+        p.echo_b_dy = 0.0;
+    }
+}
+
+/// The per-window particle field.  Squares are drawn as direct sized rect
+/// fills (they vary in size continuously, so there is nothing to pre-bake),
+/// keeping the per-frame cost at a few tiny fills regardless of size.
+pub struct SquareField {
+    pub particles: Vec<Particle>,
+}
+
+impl SquareField {
+    pub fn new() -> Self {
+        Self { particles: Vec::new() }
+    }
+}
+
+/// Roll one new square in from below the screen edge with a random size
+/// (sqrt-biased toward the small end so far-away squares are the common case),
+/// position, speed, alpha and travel target (around the mid-screen band).
+fn spawn_square(w: f64, h: f64, theme: &Theme, rng: &mut impl rand::Rng) -> Particle {
+    let hi = (theme.font_px * SQUARE_MAX_SCALE).max(SQUARE_MIN_PX + 1.0);
+    // size = min + span * sqrt(U): uniform-in-probability per *area* — more
+    // small far-away squares, fewer big close ones, no flat banding.
+    let size = SQUARE_MIN_PX + (hi - SQUARE_MIN_PX) * rng.gen::<f64>().sqrt();
+    let margin = 40.0 + rng.gen_range(0.0..=60.0);
+    let start_y = h + margin;
+    let end_y = h * 0.5 + rng.gen_range(-0.08..=0.08) * h;
+    let ref_size = theme.font_px * SQUARE_MED_REF_SCALE;
+    let speed = theme.squares_speed.max(1.0)
+        * square_speed_ratio(size, ref_size)
+        * rng.gen_range(0.8..=1.25);
+    let gmin = (theme.squares_glitch_min_s.max(0.1) * 20.0) as u32;
+    let gmax = (theme.squares_glitch_max_s.max(theme.squares_glitch_min_s) * 20.0).max(1.0) as u32;
+    Particle {
+        size,
+        x: rng.gen_range(0.0..=w),
+        y: start_y,
+        start_y,
+        end_y,
+        speed,
+        max_alpha: theme.squares_opacity.clamp(0.0, 1.0) * rng.gen_range(0.6..=1.0),
+        t: 0.0,
+        next_glitch: rng.gen_range(gmin..=gmax.max(gmin)),
+        glitch_ticks: 0,
+        glitch_dx: 0.0,
+        glitch_dy: 0.0,
+        echo_a_dx: 0.0,
+        echo_a_dy: 0.0,
+        echo_b_dx: 0.0,
+        echo_b_dy: 0.0,
+    }
+}
+
+/// Step the particle field forward `dt_sec` seconds (the 50 ms overlay tick):
+/// drift each particle toward its target, spawn by probability up to the cap,
+/// and drive the per-particle random glitch schedule.
+pub fn update_square_field(field: &mut SquareField, w: i32, h: i32, dt_sec: f64, theme: &Theme) {
+    if !theme.squares_enabled {
+        if !field.particles.is_empty() {
+            field.particles.clear();
+        }
+        return;
+    }
+    let (w, h) = ((w as f64).max(1.0), (h as f64).max(1.0));
+    let dt = dt_sec.max(0.001);
+    let gmin = (theme.squares_glitch_min_s.max(0.1) * 20.0) as u32;
+    let gmax = (theme.squares_glitch_max_s.max(theme.squares_glitch_min_s) * 20.0).max(1.0) as u32;
+    let spawn_rate = theme.squares_spawn_rate.clamp(0.0, 1.0);
+
+    let mut rng = rand::thread_rng();
+
+    for p in field.particles.iter_mut() {
+        p.t += (p.speed * dt) / (p.start_y - p.end_y).abs().max(1.0);
+        p.t = p.t.min(1.0 + 1e-6);
+        p.y = p.start_y + (p.end_y - p.start_y) * p.t;
+
+        if p.glitch_ticks > 0 {
+            p.glitch_ticks -= 1;
+            if p.glitch_ticks == 0 {
+                reset_glitch(p);
+            } else {
+                // Re-roll every step like the text glitch: the square shudders
+                // side-to-side with fresh random echoes each frame.
+                shake_square(p, &mut rng);
+            }
+        } else if p.next_glitch == 0 {
+            // Only glitch while the square is comfortably visible.
+            if (0.2..=0.85).contains(&p.t) {
+                p.glitch_ticks = theme.squares_glitch_ticks.max(1);
+                shake_square(p, &mut rng);
+            }
+            let hi = gmax.max(gmin);
+            p.next_glitch = rng.gen_range(gmin..=hi);
+        } else {
+            p.next_glitch -= 1;
+        }
+    }
+
+    let live = field.particles.iter().filter(|p| p.t < 1.0).count();
+    if (live as u32) < theme.squares_max.max(1) && rng.gen_bool(spawn_rate) {
+        field.particles.push(spawn_square(w, h, theme, &mut rng));
+    }
+    field.particles.retain(|p| p.t < 1.0);
+}
+
+/// Paint the field on the overlay: each particle is a direct sized rect fill
+/// at its lifetime alpha (a couple of tiny fills, independent of size); during
+/// a glitch burst the color_a/color_b chromatic echoes appear at random
+/// individual offsets from the shivering white square, mirroring the text
+/// glitch.
+pub fn draw_squares(cr: &cairo::Context, field: &SquareField, theme: &Theme) {
+    if !theme.squares_enabled {
+        return;
+    }
+    for p in &field.particles {
+        let alpha = square_alpha(p.t) * p.max_alpha;
+        if alpha <= 0.002 {
+            continue;
+        }
+        let s = p.size;
+        let (x, y) = (p.x + p.glitch_dx, p.y + p.glitch_dy);
+        // Chromatic echoes with random individual offsets from the glitched
+        // square — color_a trails on the left, color_b on the right, each also
+        // straying slightly up/down, exactly like the text glitch's echo split.
+        if p.echo_a_dx != 0.0 || p.echo_b_dx != 0.0 {
+            let (ar, ag, ab) = theme.color_a;
+            cr.set_source_rgba(ar, ag, ab, (alpha * 0.8).clamp(0.0, 1.0));
+            cr.rectangle(x + p.echo_a_dx, y + p.echo_a_dy, s, s);
+            let _ = cr.fill();
+            let (br, bg, bb) = theme.color_b;
+            cr.set_source_rgba(br, bg, bb, (alpha * 0.8).clamp(0.0, 1.0));
+            cr.rectangle(x + p.echo_b_dx, y + p.echo_b_dy, s, s);
+            let _ = cr.fill();
+        }
+        let (r, g, b) = theme.squares_color;
+        cr.set_source_rgba(r, g, b, alpha.clamp(0.0, 1.0));
+        cr.rectangle(x, y, s, s);
+        let _ = cr.fill();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests — render headlessly to a PNG so the output can be eyeballed without
 // touching the user's live desktop.
@@ -1045,6 +1334,18 @@ mod tests {
             glow_intensity: 0.45,
             glow_radius: 4.0,
             glow_thickness: 2.0,
+            squares_enabled: true,
+            squares_color: (1.0, 1.0, 1.0),
+            squares_opacity: 0.5,
+            squares_speed: 34.0,
+            squares_max: 48,
+            squares_spawn_rate: 0.12,
+            squares_glitch_min_s: 1.0,
+            squares_glitch_max_s: 4.5,
+            squares_glitch_ticks: 4,
+            birth_gradient: true,
+            birth_gradient_height: 0.25,
+            birth_gradient_intensity: 0.28,
         }
     }
 
@@ -1593,5 +1894,155 @@ mod tests {
             (center + aink_x + aw / 2.0 - w / 2.0).abs() < 1e-9,
             "author stays centered for center alignment"
         );
+    }
+
+    /// The lifetime alpha curve must start at 0 (invisible at birth, where
+    /// the squares emerge from the gradient), hold near 1, and return to 0
+    /// exactly as the travel progress reaches 1 at the mid-screen target.
+    #[test]
+    fn square_alpha_curve_is_fade_in_hold_fade_out() {
+        assert_eq!(square_alpha(0.0), 0.0);
+        assert!((square_alpha(0.09) - 0.5).abs() < 0.001, "linear fade-in at t=0.09");
+        assert_eq!(square_alpha(0.18), 1.0);
+        assert_eq!(square_alpha(0.5), 1.0);
+        assert!((square_alpha(0.85) - 0.5).abs() < 0.001, "linear fade-out at t=0.85");
+        assert!(square_alpha(1.0).abs() < 0.001, "alpha must reach ~0 at the target (t=1)");
+    }
+
+    /// Speed is proportional to size (the size-parallax), monotonic and
+    /// clamped to the lively envelope on both ends.
+    #[test]
+    fn square_speed_ratio_is_monotonic() {
+        assert_eq!(square_speed_ratio(1.0, 12.0), SQUARE_MIN_SPEED_RATIO);
+        assert_eq!(square_speed_ratio(100.0, 12.0), SQUARE_MAX_SPEED_RATIO);
+        let mut prev = 0.0;
+        for size in (0..100).map(|i| 1.0 + i as f64 * 0.35) {
+            let r = square_speed_ratio(size, 12.0);
+            assert!(r >= prev - 1e-9, "ratio must be non-decreasing ({r} < {prev})");
+            prev = r;
+        }
+        // The reference (medium) size drifts at exactly the base ratio 1.0.
+        assert!((square_speed_ratio(12.0, 12.0) - 1.0).abs() < 1e-9);
+    }
+
+    /// Spawns fill the whole continuous size range and scale speed with size:
+    /// the very small (far-away) fraction must always drift slower than the
+    /// very large (close) fraction, regardless of per-particle random jitter.
+    #[test]
+    fn square_sizes_and_speeds_are_proportional() {
+        let theme = test_theme();
+        let hi = (theme.font_px * SQUARE_MAX_SCALE).max(SQUARE_MIN_PX + 1.0);
+        let span = hi - SQUARE_MIN_PX;
+        // In sqrt-bias space, P(size < min + span*q) == q².  0.20 → ~4% of
+        // spawns, 0.85 → ~28% of spawns large; speeds are well separated even
+        // with the 0.8..1.25 random jitter.
+        let small_cut = SQUARE_MIN_PX + span * 0.20;
+        let large_cut = SQUARE_MIN_PX + span * 0.85;
+
+        let mut rng = rand::thread_rng();
+        let mut small_max = 0.0f64;
+        let mut large_min = f64::MAX;
+        let (mut n_small, mut n_large) = (0usize, 0usize);
+        for _ in 0..600 {
+            let p = spawn_square(800.0, 600.0, &theme, &mut rng);
+            assert!(
+                (SQUARE_MIN_PX..=hi).contains(&p.size),
+                "size must stay within the spawn range"
+            );
+            if p.size < small_cut {
+                small_max = small_max.max(p.speed);
+                n_small += 1;
+            } else if p.size > large_cut {
+                large_min = large_min.min(p.speed);
+                n_large += 1;
+            }
+        }
+        assert!(
+            n_small > 10 && n_large > 10,
+            "both size buckets must populate ({n_small}, {n_large})"
+        );
+        assert!(
+            small_max < large_min,
+            "small far-away squares must drift slower than big close ones ({small_max} vs {large_min})"
+        );
+    }
+
+    /// The ticking update advances a particle toward its target, keeps the
+    /// dead (t >= 1) ones out, and caps live particles at `squares_max`.
+    #[test]
+    fn square_update_drifts_and_evicts() {
+        let mut theme = test_theme();
+        theme.squares_spawn_rate = 0.0; // deterministic: never auto-spawn
+        theme.squares_max = u32::MAX;
+        let mut field = SquareField::new();
+        let mut p = spawn_square(800.0, 600.0, &theme, &mut rand::thread_rng());
+        p.glitch_ticks = 0;
+        p.next_glitch = u32::MAX; // never glitch during the test
+        field.particles.push(p);
+        let (w, h) = (800, 600);
+        // A handful of ticks must move the particle upward toward its target.
+        for _ in 0..10 {
+            update_square_field(&mut field, w, h, 0.05, &theme);
+        }
+        assert_eq!(field.particles.len(), 1);
+        assert!(field.particles[0].t > 0.0, "progress must increase");
+        assert!(p.y >= field.particles[0].y, "y must drift toward the top");
+
+        // A particle already at the end is evicted on the next tick.
+        let mut done = spawn_square(800.0, 600.0, &theme, &mut rand::thread_rng());
+        done.t = 1.0;
+        done.glitch_ticks = 0;
+        done.next_glitch = u32::MAX;
+        field.particles.push(done);
+        update_square_field(&mut field, w, h, 0.05, &theme);
+        assert_eq!(
+            field.particles.len(),
+            1,
+            "expired particle must be culled"
+        );
+
+        // Drawing a fully-visible particle paints a solid sized square: fill
+        // it at alpha 1 on a surface and probe a pixel inside its bounds.
+        field.particles[0].size = 8.0;
+        field.particles[0].t = 0.5;
+        field.particles[0].max_alpha = 1.0;
+        field.particles[0].x = 100.0;
+        field.particles[0].y = 300.0;
+        reset_glitch(&mut field.particles[0]);
+        let mut surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
+        {
+            let cr = cairo::Context::new(&surf).expect("context");
+            draw_squares(&cr, &field, &theme);
+        }
+        let data = surf.data().expect("data");
+        // Fill covers x 100..108 / y 300..308; probe the center.
+        let pl = (304 * w + 104) as usize * 4;
+        let bright = data[pl].max(data[pl + 1]).max(data[pl + 2]);
+        assert!(
+            bright > 200,
+            "fully-visible square must paint bright pixels (got {bright})"
+        );
+    }
+
+    /// The birth gradient paints a soft bottom band (the square-spawn zone)
+    /// and leaves the top of the frame untouched.
+    #[test]
+    fn birth_gradient_paints_bottom_band() {
+        let (w, h) = (400, 400);
+        let theme = test_theme();
+        let mut surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
+        {
+            let cr = cairo::Context::new(&surf).expect("context");
+            cr.set_source_rgb(theme.bg.0, theme.bg.1, theme.bg.2);
+            cr.paint();
+            draw_birth_gradient(&cr, w as f64, h as f64, &theme);
+        }
+        let data = surf.data().expect("data");
+        let bottom_pl = ((h - 4) * w + w / 2) as usize * 4;
+        let top_pl = (10 * w + w / 2) as usize * 4;
+        let bottom = data[bottom_pl].max(data[bottom_pl + 1]).max(data[bottom_pl + 2]);
+        let top = data[top_pl].max(data[top_pl + 1]).max(data[top_pl + 2]);
+        assert!(bottom > top + 30, "bottom band must be brighter than the top ({bottom} vs {top})");
+        assert!(top < 30, "top of the frame must stay dark ({top})");
     }
 }

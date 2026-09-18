@@ -92,6 +92,9 @@ pub struct Config {
     /// Glow effect settings for the quote text.
     #[serde(default)]
     pub glow: GlowConfig,
+    /// Floating glitched-squares effect settings.
+    #[serde(default)]
+    pub squares: SquaresConfig,
     /// Quote-pipeline settings (also read by Agent 3 directly from the file).
     #[serde(default)]
     pub quotes: QuotesConfig,
@@ -108,6 +111,7 @@ impl Config {
             accent: AccentConfig::defaults(),
             glitch: GlitchConfig::defaults(),
             glow: GlowConfig::defaults(),
+            squares: SquaresConfig::defaults(),
             quotes: QuotesConfig::defaults(),
             monitors: MonitorsConfig::defaults(),
         }
@@ -366,6 +370,115 @@ impl GlowConfig {
 }
 
 impl Default for GlowConfig {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+/// Floating glitched-squares effect: tiny and medium squares drift from below
+/// the screen up toward the middle, fading in as they emerge from the bottom
+/// birth-glow gradient and back out before they reach the target band.  Each
+/// square randomly fire a short chromatic glitch burst (the same color_a /
+/// color_b echo of the text glitch) at random intervals during its life.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SquaresConfig {
+    /// Master switch: `false` draws no squares and no birth gradient.
+    #[serde(default = "SquaresConfig::default_enabled")]
+    pub enabled: bool,
+    /// Square color, CSS hex (`"#rrggbb"`); also tints the birth gradient.
+    #[serde(default = "SquaresConfig::default_color")]
+    pub color: String,
+    /// Peak alpha (0..1) of a fully-visible square.
+    #[serde(default = "SquaresConfig::default_opacity")]
+    pub opacity: f32,
+    /// Base vertical drift speed in px/sec toward the top.  This is the speed of
+    /// a square at the "reference" size (~half the font height); each square's
+    /// actual speed scales with its size, so smaller (far-away) squares drift
+    /// slower and larger (close) ones faster.
+    #[serde(default = "SquaresConfig::default_speed")]
+    pub speed: f32,
+    /// Hard cap on simultaneously-live squares (bounds the per-frame cost).
+    #[serde(default = "SquaresConfig::default_max_particles")]
+    pub max_particles: u32,
+    /// Chance (0..1) of spawning one new square per 50 ms overlay tick.
+    #[serde(default = "SquaresConfig::default_spawn_rate")]
+    pub spawn_rate: f32,
+    /// Lower bound of the random interval before a square glitches (sec).
+    #[serde(default = "SquaresConfig::default_glitch_interval_min_seconds")]
+    pub glitch_interval_min_seconds: f32,
+    /// Upper bound of the random interval before a square glitches (sec).
+    #[serde(default = "SquaresConfig::default_glitch_interval_max_seconds")]
+    pub glitch_interval_max_seconds: f32,
+    /// Glitch burst length in overlay ticks (~50 ms each).
+    #[serde(default = "SquaresConfig::default_glitch_duration_steps")]
+    pub glitch_duration_steps: u32,
+    /// Bottom "birth" gradient switch (soft white-to-transparent band).
+    #[serde(default = "SquaresConfig::default_gradient")]
+    pub gradient: bool,
+    /// Birth-band height as a fraction of the screen height (0..1).
+    #[serde(default = "SquaresConfig::default_gradient_height")]
+    pub gradient_height: f32,
+    /// Telemetry of the birth-band gradient (0..1).
+    #[serde(default = "SquaresConfig::default_gradient_intensity")]
+    pub gradient_intensity: f32,
+}
+
+impl SquaresConfig {
+    fn defaults() -> Self {
+        Self {
+            enabled: Self::default_enabled(),
+            color: Self::default_color(),
+            opacity: Self::default_opacity(),
+            speed: Self::default_speed(),
+            max_particles: Self::default_max_particles(),
+            spawn_rate: Self::default_spawn_rate(),
+            glitch_interval_min_seconds: Self::default_glitch_interval_min_seconds(),
+            glitch_interval_max_seconds: Self::default_glitch_interval_max_seconds(),
+            glitch_duration_steps: Self::default_glitch_duration_steps(),
+            gradient: Self::default_gradient(),
+            gradient_height: Self::default_gradient_height(),
+            gradient_intensity: Self::default_gradient_intensity(),
+        }
+    }
+    fn default_enabled() -> bool {
+        true
+    }
+    fn default_color() -> String {
+        "#ffffff".into()
+    }
+    fn default_opacity() -> f32 {
+        0.7
+    }
+    fn default_speed() -> f32 {
+        36.0
+    }
+    fn default_max_particles() -> u32 {
+        50
+    }
+    fn default_spawn_rate() -> f32 {
+        0.12
+    }
+    fn default_glitch_interval_min_seconds() -> f32 {
+        1.0
+    }
+    fn default_glitch_interval_max_seconds() -> f32 {
+        4.5
+    }
+    fn default_glitch_duration_steps() -> u32 {
+        4
+    }
+    fn default_gradient() -> bool {
+        true
+    }
+    fn default_gradient_height() -> f32 {
+        0.48
+    }
+    fn default_gradient_intensity() -> f32 {
+        0.18
+    }
+}
+
+impl Default for SquaresConfig {
     fn default() -> Self {
         Self::defaults()
     }

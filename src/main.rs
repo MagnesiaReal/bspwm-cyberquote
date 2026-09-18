@@ -220,6 +220,10 @@ struct MonitorWindow {
     typewriter_token: Rc<Cell<u64>>,
     /// Blink phase of the terminal caret (toggled by `arm_cursor_blink`).
     cursor_on: Rc<Cell<bool>>,
+    /// Floating glitched-squares particle field (overlay-only effect).
+    squares: Rc<RefCell<render::SquareField>>,
+    /// True when the RGBA overlay exists (the floating squares only render there).
+    animated: bool,
 }
 
 fn main() {
@@ -279,6 +283,21 @@ fn build_windows(app: &Application) {
         },
         glow_radius: cfg.glow.radius.max(0.0) as f64,
         glow_thickness: cfg.glow.thickness.max(0.0) as f64,
+        squares_enabled: cfg.squares.enabled,
+        squares_color: render::hex_color(&cfg.squares.color),
+        squares_opacity: cfg.squares.opacity.clamp(0.0, 1.0) as f64,
+        squares_speed: cfg.squares.speed.max(1.0) as f64,
+        squares_max: cfg.squares.max_particles,
+        squares_spawn_rate: cfg.squares.spawn_rate.clamp(0.0, 1.0) as f64,
+        squares_glitch_min_s: cfg.squares.glitch_interval_min_seconds.max(0.0) as f64,
+        squares_glitch_max_s: cfg
+            .squares
+            .glitch_interval_max_seconds
+            .max(cfg.squares.glitch_interval_min_seconds) as f64,
+        squares_glitch_ticks: cfg.squares.glitch_duration_steps.max(1),
+        birth_gradient: cfg.squares.gradient,
+        birth_gradient_height: cfg.squares.gradient_height.clamp(0.0, 1.0) as f64,
+        birth_gradient_intensity: cfg.squares.gradient_intensity.clamp(0.0, 1.0) as f64,
     };
 
     // ---- monitor policy ----
@@ -370,7 +389,15 @@ fn build_windows(app: &Application) {
                 &mw.typewriter_token,
             );
         }
-        arm_scan_timer(&mw.scan_area, &mw.scan_phase, geometry.height as f64, cfg.accent.scanline_lines);
+        arm_scan_timer(
+            &mw.scan_area,
+            &mw.scan_phase,
+            geometry.width as f64,
+            geometry.height as f64,
+            cfg.accent.scanline_lines,
+            mw.animated.then_some(&mw.squares),
+            &theme,
+        );
         mw.window.show_all();
         let dbg = mw.window.window().map(|w| format!("gdk_vis={}", w.is_visible()));
         eprintln!(
@@ -452,6 +479,7 @@ fn build_monitor_window(
     let glitch_echo_px = Rc::new(Cell::new(0.0f64));
     let glow_cache = Rc::new(RefCell::new(render::GlowCache::new()));
     let text_cache = Rc::new(RefCell::new(render::TextSurfaceCache::new()));
+    let squares = Rc::new(RefCell::new(render::SquareField::new()));
 
     // Main layer draws its own static scanlines only when there is no RGBA
     // compositor to host the animated overlay (avoids double-darkening).
@@ -502,6 +530,7 @@ fn build_monitor_window(
         let s_glitch = glitch_on.clone();
         let s_quote = quote.clone();
         let s_typer = typewriter_chars.clone();
+        let s_squares = squares.clone();
         scan_area.connect_draw(move |_, cr| {
             let tw = s_area.allocated_width();
             let th = s_area.allocated_height();
@@ -519,6 +548,11 @@ fn build_monitor_window(
             if let Some((_, _, tile)) = s_tile.borrow().as_ref() {
                 render::draw_scanline_tile(cr, &s_theme, s_phase.get(), tile);
             }
+            // The floating glitched squares: pre-baked sprite blits at per-
+            // particle alpha, so their 20 fps animation is a few tiny paints.
+            let sq = s_squares.borrow();
+            render::draw_squares(cr, &sq, &s_theme);
+            drop(sq);
             // The blinking terminal caret rides this overlay: it is a single
             // small rect fill per frame, so its ~2 Hz blink costs nothing on
             // the heavy text layer.  Hidden during a glitch burst.
@@ -570,6 +604,8 @@ fn build_monitor_window(
         typewriter_chars,
         typewriter_token,
         cursor_on,
+        squares,
+        animated,
     }
 }
 
@@ -820,27 +856,55 @@ fn arm_cursor_blink(area: &DrawingArea, overlay: Option<&DrawingArea>, cursor_on
     });
 }
 
-/// Roll the scanline mesh continuously from the top edge toward the bottom.
+/// Roll the scanline mesh continuously from the top edge toward the bottom
+/// and advance the floating-squares field on the same ~20 fps overlay tick.
 /// One full screen-height sweep takes `SCAN_SWEEP_SECS` (matches the HTML
-/// version's `--scanline-speed: 90s`), redrawn at ~20 fps.  The per-frame work
-/// is only the overlay's ~`lines` thin bands — the text layer is not
-/// repainted by this timer.
+/// version's `--scanline-speed: 90s`), redrawn once per tick.  The per-frame
+/// work is only the overlay's ~`lines` thin bands plus a handful of small
+/// sprite blits — the text layer is not repainted by this timer.  When only
+/// the squares are enabled (no scanlines) the ticker still runs for them.
 const SCAN_SWEEP_SECS: f64 = 90.0;
 const SCAN_ANIM_MS: u64 = 50;
 
-fn arm_scan_timer(area: &DrawingArea, phase: &Rc<Cell<f64>>, h: f64, lines: u32) {
-    if lines == 0 || h <= 0.0 {
+fn arm_scan_timer(
+    area: &DrawingArea,
+    phase: &Rc<Cell<f64>>,
+    w: f64,
+    h: f64,
+    lines: u32,
+    squares: Option<&Rc<RefCell<render::SquareField>>>,
+    theme: &render::Theme,
+) {
+    let has_scan = lines > 0 && h > 0.0;
+    if !has_scan && squares.is_none() {
         return;
     }
     // Wrap on the integer pattern period so it matches the tile exactly.
-    let period = render::scanline_tile_height(h, lines);
-    let delta = h / (SCAN_SWEEP_SECS * (1000.0 / SCAN_ANIM_MS as f64));
+    let period = if has_scan { render::scanline_tile_height(h, lines) } else { 1.0 };
+    let delta = if has_scan {
+        h / (SCAN_SWEEP_SECS * (1000.0 / SCAN_ANIM_MS as f64))
+    } else {
+        0.0
+    };
 
     let area = area.clone();
     let phase = phase.clone();
+    let squares = squares.cloned();
+    let theme = theme.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(SCAN_ANIM_MS), move || {
-        let p = phase.get() + delta;
-        phase.set(if p >= period { p - period } else { p });
+        if delta > 0.0 {
+            let p = phase.get() + delta;
+            phase.set(if p >= period { p - period } else { p });
+        }
+        if let Some(sq) = &squares {
+            render::update_square_field(
+                &mut sq.borrow_mut(),
+                w as i32,
+                h as i32,
+                SCAN_ANIM_MS as f64 / 1000.0,
+                &theme,
+            );
+        }
         area.queue_draw();
         glib::ControlFlow::Continue
     });
