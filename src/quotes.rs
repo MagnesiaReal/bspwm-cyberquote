@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A single quote with its attributed source.
 #[derive(Debug, Clone, Deserialize)]
@@ -39,18 +39,56 @@ pub struct QuoteSelection {
     pub quote: Quote,
 }
 
-fn default_quotes_path() -> &'static Path {
-    // Project-root quotes.json; a config can override this.
-    Path::new("quotes.json")
+/// The user-level config directory: `$XDG_CONFIG_HOME/bspwm-cyberquote`, or
+/// `~/.config/bspwm-cyberquote` when XDG_CONFIG_HOME is unset.
+fn user_config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("bspwm-cyberquote"));
+        }
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/bspwm-cyberquote"))
 }
 
-/// Load all non-empty quotes from a `quotes.json` file.
-pub fn load_all(quotes_path: Option<&Path>) -> Result<Vec<Quote>, String> {
-    let path: &Path = quotes_path.unwrap_or_else(|| default_quotes_path());
+/// Default search locations for the quote pool, in order:
+/// `~/.config/bspwm-cyberquote/quotes.json`, then
+/// `/etc/bspwm-cyberquote/quotes.json` (the packaged fallback).
+fn default_quotes_paths() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(dir) = user_config_dir() {
+        v.push(dir.join("quotes.json"));
+    }
+    v.push(PathBuf::from("/etc/bspwm-cyberquote/quotes.json"));
+    v
+}
 
-    let raw = fs::read_to_string(path).map_err(|e| {
-        format!("Failed to read {}: {}", path.display(), e)
-    })?;
+/// Candidate quote files to try, in order.  An explicitly configured `source`
+/// is tried first and honoured when it exists.  For a relative source (the
+/// default `"quotes.json"`) the working-directory attempt is followed by the
+/// user and global locations; an absolute override is authoritative on its own.
+fn candidate_paths(quotes_path: Option<&Path>) -> Vec<PathBuf> {
+    match quotes_path {
+        Some(p) => {
+            let mut v = vec![p.to_path_buf()];
+            if p.is_relative() {
+                let name = p
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("quotes.json"));
+                if let Some(dir) = user_config_dir() {
+                    v.push(dir.join(&name));
+                }
+                v.push(PathBuf::from("/etc/bspwm-cyberquote").join(&name));
+            }
+            v
+        }
+        None => default_quotes_paths(),
+    }
+}
+
+/// Read and validate one quotes file.
+fn read_quotes(path: &Path) -> Result<Vec<Quote>, String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
 
     let file: QuotesFile = serde_json::from_str(&raw).map_err(|e| {
         format!("Failed to parse {}: {}", path.display(), e)
@@ -67,6 +105,32 @@ pub fn load_all(quotes_path: Option<&Path>) -> Result<Vec<Quote>, String> {
     }
 
     Ok(quotes)
+}
+
+/// Load all non-empty quotes from the first readable quotes file.
+///
+/// Search order: a configured `source` first (honoured when it exists);
+/// otherwise (or for a relative source that is missing) the defaults are
+/// tried in turn — `~/.config/bspwm-cyberquote/quotes.json`, then the
+/// packaged `/etc/bspwm-cyberquote/quotes.json`.
+pub fn load_all(quotes_path: Option<&Path>) -> Result<Vec<Quote>, String> {
+    let candidates = candidate_paths(quotes_path);
+    let mut tried = Vec::new();
+    for path in &candidates {
+        match read_quotes(path) {
+            Ok(quotes) => return Ok(quotes),
+            Err(e) => tried.push(e),
+        }
+    }
+    Err(format!(
+        "No readable quotes file (tried {}): {}",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        tried.join("; ")
+    ))
 }
 
 /// Pick a single quote using `picker`. Random is the default picker.

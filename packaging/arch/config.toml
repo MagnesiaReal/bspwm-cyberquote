@@ -21,8 +21,8 @@ orange = "#ffe3b3"
 author_color = "#F4E394"
 cursor_color = "#F4E394"
 scanline_opacity = 0.20
-scanline_steps = 2160
-scanline_lines = 208
+scanline_steps = 2000
+scanline_lines = 200
 scanline_size_rem = 0.5
 crt_curvature = 0.15
 
@@ -49,13 +49,13 @@ thickness = 1.0
 # chromatic glitch burst (color_a/color_b echoes, like the text glitch).
 enabled = true
 color = "#ffffff"
-opacity = 0.5
+opacity = 0.7
 # Base drift speed (px/sec) for a square at the reference size (~half the font
 # height).  Squares use a random size between SQUARE_MIN_PX and 0.8×font; each
 # one's speed scales proportionally with its size (small/far-away = slow,
 # large/close = fast).
-speed = 34
-max_particles = 48
+speed = 36
+max_particles = 50
 spawn_rate = 0.12
 glitch_interval_min_seconds = 1.0
 glitch_interval_max_seconds = 4.5
@@ -67,13 +67,15 @@ gradient = true
 # Where the gradient *ends* (fades out): band height as a fraction of the
 # screen height.  0.25 = glow covers the bottom quarter, ends at 75% up the
 # screen; smaller = a short sharp band near the bottom; larger = climbs higher.
-gradient_height = 0.25
+gradient_height = 0.48
 # Peak opacity at the very bottom edge (0.0 = invisible, 1.0 = solid).  The
 # band fades linearly from this at the bottom to 0 at the top of the band.
-gradient_intensity = 0.28
+gradient_intensity = 0.18
 
 [quotes]
-# Relative to the working directory, or an absolute path.
+# Quote pool location.  An absolute path is used as-is; a relative name is
+# tried against the working directory first, then the defaults:
+# ~/.config/bspwm-cyberquote/quotes.json, then /etc/bspwm-cyberquote/quotes.json.
 source = "quotes.json"
 cycle_interval_minutes = 0
 picker = "random"

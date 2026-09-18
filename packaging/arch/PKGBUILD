@@ -54,9 +54,10 @@ package() {
     # System-wide default config (auto-copied to ~/.config on first run).
     install -Dm644 "$repo/packaging/arch/config.toml" \
         "$pkgdir/etc/bspwm-cyberquote/config.toml"
-    # Quote pool.
+    # Quote pool — packaged default used as the fallback when there is no
+    # ~/.config/bspwm-cyberquote/quotes.json.
     install -Dm644 "$repo/quotes.json" \
-        "$pkgdir/usr/share/bspwm-cyberquote/quotes.json"
+        "$pkgdir/etc/bspwm-cyberquote/quotes.json"
     # Docs + license.
     install -Dm644 "$repo/README.md" \
         "$pkgdir/usr/share/doc/bspwm-cyberquote/README.md"

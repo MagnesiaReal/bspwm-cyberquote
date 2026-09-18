@@ -73,7 +73,9 @@ gradient_height = 0.48
 gradient_intensity = 0.18
 
 [quotes]
-# Relative to the working directory, or an absolute path.
+# Quote pool location.  An absolute path is used as-is; a relative name is
+# tried against the working directory first, then the defaults:
+# ~/.config/bspwm-cyberquote/quotes.json, then /etc/bspwm-cyberquote/quotes.json.
 source = "quotes.json"
 cycle_interval_minutes = 0
 picker = "random"
