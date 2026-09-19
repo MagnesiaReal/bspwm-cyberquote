@@ -1,6 +1,0 @@
-EOF
-╭─magneciareal@MagneciaCore ~/Desktop/bspwm-cyberquote  ‹main› 
-╰─➤  ollama run qwen3.8:latest                   
->>> hello there
-Thinking...
-The user is simply greeting me with hello

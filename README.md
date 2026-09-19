@@ -13,10 +13,12 @@ From the AUR (requires an AUR helper such as `paru`, or build by hand):
 paru -S bspwm-cyberquote
 ```
 
-Or from a source checkout, build the package directly:
+Or build from the AUR sources directly:
 
 ```sh
-makepkg -si           # run from the repository root or from packaging/arch/
+git clone https://aur.archlinux.org/bspwm-cyberquote.git
+cd bspwm-cyberquote
+makepkg -si
 ```
 
 This installs:
