@@ -7,6 +7,14 @@ reveal, terminal caret):
 
 ## Install (Arch Linux)
 
+From the AUR (requires an AUR helper such as `paru`, or build by hand):
+
+```sh
+paru -S bspwm-cyberquote
+```
+
+Or from a source checkout, build the package directly:
+
 ```sh
 makepkg -si           # run from the repository root or from packaging/arch/
 ```

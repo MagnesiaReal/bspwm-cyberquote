@@ -1,0 +1,62 @@
+# Maintainer: MagnesiaReal <mgarridor1400 at alumno dot ipn dot mx>
+#
+# AUR submission — see https://wiki.archlinux.org/title/AUR_submission_guidelines
+# This PKGBUILD builds from the v0.1.0 release tarball on GitHub.  Keep
+# .SRCINFO in sync with `makepkg --printsrcinfo > .SRCINFO` whenever pkgver or
+# metadata above change.
+#
+# NOTE: sha256sums below is a placeholder that must be replaced with the real
+# checksum of https://github.com/MagnesiaReal/bspwm-cyberquote/archive/v0.1.0.tar.gz
+# once the v0.1.0 tag exists on GitHub (codeload gzip output is not
+# reproducible locally via `git archive`).
+
+pkgname=bspwm-cyberquote
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Cairo/Pango desktop quote ticker for bspwm — cyberpunk overlay, no WebView'
+arch=('x86_64')
+url='https://github.com/MagnesiaReal/bspwm-cyberquote'
+license=('MIT')
+depends=('gtk3' 'glib2' 'pango' 'cairo')
+makedepends=('cargo' 'pkgconf')
+backup=('etc/bspwm-cyberquote/config.toml')
+source=("$pkgname-v$pkgver.tar.gz::https://github.com/MagnesiaReal/$pkgname/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cd "$srcdir/$pkgname-v$pkgver"
+    cargo fetch --locked --target host-tuple
+}
+
+build() {
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cd "$srcdir/$pkgname-v$pkgver"
+    cargo build --frozen --release --all-features
+}
+
+check() {
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cd "$srcdir/$pkgname-v$pkgver"
+    cargo test --frozen --all-features
+}
+
+package() {
+    cd "$srcdir/$pkgname-v$pkgver"
+    # Binary.
+    install -Dm755 "target/release/$pkgname" -t "$pkgdir/usr/bin/"
+    # System-wide default config; the app copies it to ~/.config on first run.
+    install -Dm644 "packaging/arch/config.toml" \
+        "$pkgdir/etc/bspwm-cyberquote/config.toml"
+    # Default quote pool — fallback when there is no user quotes.json.
+    install -Dm644 "quotes.json" \
+        "$pkgdir/etc/bspwm-cyberquote/quotes.json"
+    # Docs + license.
+    install -Dm644 "README.md" \
+        "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 "LICENSE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

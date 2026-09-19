@@ -17,6 +17,9 @@ target
 packaging/arch/*.pkg.tar.zst
 packaging/arch/pkg/
 packaging/arch/src/
+packaging/aur/*.pkg.tar.zst
+packaging/aur/pkg/
+packaging/aur/src/
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
